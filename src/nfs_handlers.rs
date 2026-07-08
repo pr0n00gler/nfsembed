@@ -998,7 +998,7 @@ pub async fn nfsproc3_readdir(
     let mut ctr = 0;
     match context
         .vfs
-        .readdir_simple(dirid, args.cookie, estimated_max_results as usize)
+        .readdir(dirid, args.cookie, estimated_max_results as usize)
         .await
     {
         Ok(result) => {
