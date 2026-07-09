@@ -170,7 +170,7 @@ impl FSMap {
                 cur_path.pop();
             }
             self.id_to_path.get_mut(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?.children =
-                Some(BTreeSet::from_iter(new_children.into_iter()));
+                Some(BTreeSet::from_iter(new_children));
         }
 
         Ok(())

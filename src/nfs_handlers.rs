@@ -996,11 +996,7 @@ pub async fn nfsproc3_readdir(
     // This is hard to ballpark, so we just divide it by 16
     let estimated_max_results = args.dircount / 16;
     let mut ctr = 0;
-    match context
-        .vfs
-        .readdir(dirid, args.cookie, estimated_max_results as usize)
-        .await
-    {
+    match context.vfs.readdir(dirid, args.cookie, estimated_max_results as usize).await {
         Ok(result) => {
             // we count dir_count seperately as it is just a subset of fields
             let mut accumulated_dircount: usize = 0;
@@ -1477,22 +1473,13 @@ pub async fn nfsproc3_setattr(
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
         stat.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
         return Ok(());
     }
     let id = id.unwrap();
 
-    let ctime;
-
-    let pre_op_attr = match context.vfs.getattr(id).await {
-        Ok(v) => {
-            let wccattr = nfs::wcc_attr {
-                size: v.size,
-                mtime: v.mtime,
-                ctime: v.ctime,
-            };
-            ctime = v.ctime;
-            nfs::pre_op_attr::attributes(wccattr)
-        },
+    let current_attr = match context.vfs.getattr(id).await {
+        Ok(v) => v,
         Err(stat) => {
             make_success_reply(xid).serialize(output)?;
             stat.serialize(output)?;
@@ -1500,14 +1487,24 @@ pub async fn nfsproc3_setattr(
             return Ok(());
         },
     };
+    let pre_op_attr = nfs::pre_op_attr::attributes(nfs::wcc_attr {
+        size: current_attr.size,
+        mtime: current_attr.mtime,
+        ctime: current_attr.ctime,
+    });
     // handle the guard
     match args.guard {
         sattrguard3::Void => {},
         sattrguard3::obj_ctime(c) => {
-            if c.seconds != ctime.seconds || c.nseconds != ctime.nseconds {
+            if c.seconds != current_attr.ctime.seconds || c.nseconds != current_attr.ctime.nseconds {
                 make_success_reply(xid).serialize(output)?;
                 nfs::nfsstat3::NFS3ERR_NOT_SYNC.serialize(output)?;
-                nfs::wcc_data::default().serialize(output)?;
+                nfs::wcc_data {
+                    before: pre_op_attr,
+                    after: nfs::post_op_attr::attributes(current_attr),
+                }
+                .serialize(output)?;
+                return Ok(());
             }
         },
     }
@@ -2116,4 +2113,263 @@ pub async fn nfsproc3_readlink(
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::context::RPCContext;
+    use crate::transaction_tracker::TransactionTracker;
+    use crate::vfs::{NFSFileSystem, ReadDirResult};
+
+    const FILE_ID: nfs::fileid3 = 7;
+    const XID: u32 = 0x1234_5678;
+
+    struct SetattrGuardTestFs {
+        attr: nfs::fattr3,
+        reject_handle: bool,
+        setattr_calls: AtomicUsize,
+    }
+
+    impl SetattrGuardTestFs {
+        fn new(reject_handle: bool) -> Self {
+            Self {
+                attr: nfs::fattr3 {
+                    size: 128,
+                    fileid: FILE_ID,
+                    mtime: nfs::nfstime3 {
+                        seconds: 20,
+                        nseconds: 30,
+                    },
+                    ctime: nfs::nfstime3 {
+                        seconds: 40,
+                        nseconds: 50,
+                    },
+                    ..Default::default()
+                },
+                reject_handle,
+                setattr_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NFSFileSystem for SetattrGuardTestFs {
+        fn capabilities(&self) -> VFSCapabilities {
+            VFSCapabilities::ReadWrite
+        }
+
+        fn root_dir(&self) -> nfs::fileid3 {
+            FILE_ID
+        }
+
+        fn fh_to_id(&self, _handle: &nfs::nfs_fh3) -> Result<nfs::fileid3, nfs::nfsstat3> {
+            if self.reject_handle {
+                Err(nfs::nfsstat3::NFS3ERR_BADHANDLE)
+            } else {
+                Ok(FILE_ID)
+            }
+        }
+
+        async fn lookup(
+            &self,
+            _dirid: nfs::fileid3,
+            _filename: &nfs::filename3,
+        ) -> Result<nfs::fileid3, nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn getattr(&self, _id: nfs::fileid3) -> Result<nfs::fattr3, nfs::nfsstat3> {
+            Ok(self.attr)
+        }
+
+        async fn setattr(&self, _id: nfs::fileid3, setattr: nfs::sattr3) -> Result<nfs::fattr3, nfs::nfsstat3> {
+            self.setattr_calls.fetch_add(1, Ordering::SeqCst);
+            let mut attr = self.attr;
+            if let nfs::set_size3::size(size) = setattr.size {
+                attr.size = size;
+            }
+            Ok(attr)
+        }
+
+        async fn read(&self, _id: nfs::fileid3, _offset: u64, _count: u32) -> Result<(Vec<u8>, bool), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn write(&self, _id: nfs::fileid3, _offset: u64, _data: &[u8]) -> Result<nfs::fattr3, nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn create(
+            &self,
+            _dirid: nfs::fileid3,
+            _filename: &nfs::filename3,
+            _attr: nfs::sattr3,
+        ) -> Result<(nfs::fileid3, nfs::fattr3), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn create_exclusive(
+            &self,
+            _dirid: nfs::fileid3,
+            _filename: &nfs::filename3,
+        ) -> Result<nfs::fileid3, nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn mkdir(
+            &self,
+            _dirid: nfs::fileid3,
+            _dirname: &nfs::filename3,
+        ) -> Result<(nfs::fileid3, nfs::fattr3), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn remove(&self, _dirid: nfs::fileid3, _filename: &nfs::filename3) -> Result<(), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn rename(
+            &self,
+            _from_dirid: nfs::fileid3,
+            _from_filename: &nfs::filename3,
+            _to_dirid: nfs::fileid3,
+            _to_filename: &nfs::filename3,
+        ) -> Result<(), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn readdir(
+            &self,
+            _dirid: nfs::fileid3,
+            _start_after: nfs::fileid3,
+            _max_entries: usize,
+        ) -> Result<ReadDirResult, nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn symlink(
+            &self,
+            _dirid: nfs::fileid3,
+            _linkname: &nfs::filename3,
+            _symlink: &nfs::nfspath3,
+            _attr: &nfs::sattr3,
+        ) -> Result<(nfs::fileid3, nfs::fattr3), nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+
+        async fn readlink(&self, _id: nfs::fileid3) -> Result<nfs::nfspath3, nfs::nfsstat3> {
+            Err(nfs::nfsstat3::NFS3ERR_NOTSUPP)
+        }
+    }
+
+    fn test_context(vfs: Arc<SetattrGuardTestFs>) -> RPCContext {
+        RPCContext {
+            local_port: 0,
+            client_addr: "setattr-guard-test".to_owned(),
+            auth: auth_unix::default(),
+            vfs,
+            mount_signal: None,
+            export_name: Arc::new("/".to_owned()),
+            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+        }
+    }
+
+    fn setattr_request(guard: sattrguard3) -> Vec<u8> {
+        let args = SETATTR3args {
+            object: nfs::nfs_fh3 { data: vec![1] },
+            new_attribute: nfs::sattr3 {
+                size: nfs::set_size3::size(0),
+                ..Default::default()
+            },
+            guard,
+        };
+        let mut input = Vec::new();
+        args.serialize(&mut input).unwrap();
+        input
+    }
+
+    fn decode_setattr_reply(output: &[u8]) -> (u32, nfs::wcc_data) {
+        let mut cursor = Cursor::new(output);
+        let mut reply = rpc_msg::default();
+        reply.deserialize(&mut cursor).unwrap();
+        assert_eq!(reply.xid, XID);
+        assert!(matches!(
+            reply.body,
+            rpc_body::REPLY(reply_body::MSG_ACCEPTED(accepted_reply {
+                reply_data: accept_body::SUCCESS,
+                ..
+            }))
+        ));
+
+        let mut status = 0_u32;
+        status.deserialize(&mut cursor).unwrap();
+        let mut wcc = nfs::wcc_data::default();
+        wcc.deserialize(&mut cursor).unwrap();
+        assert_eq!(
+            cursor.position() as usize,
+            output.len(),
+            "SETATTR reply must not contain a second, trailing result"
+        );
+        (status, wcc)
+    }
+
+    #[tokio::test]
+    async fn stale_setattr_guard_does_not_truncate_and_returns_single_not_sync_reply() {
+        let fs = Arc::new(SetattrGuardTestFs::new(false));
+        let context = test_context(Arc::clone(&fs));
+        let stale_ctime = nfs::nfstime3 {
+            seconds: fs.attr.ctime.seconds - 1,
+            nseconds: fs.attr.ctime.nseconds,
+        };
+        let input = setattr_request(sattrguard3::obj_ctime(stale_ctime));
+        let mut output = Vec::new();
+
+        nfsproc3_setattr(XID, &mut Cursor::new(input), &mut output, &context)
+            .await
+            .unwrap();
+
+        assert_eq!(fs.setattr_calls.load(Ordering::SeqCst), 0);
+        let (status, wcc) = decode_setattr_reply(&output);
+        assert_eq!(status, nfs::nfsstat3::NFS3ERR_NOT_SYNC as u32);
+        match wcc.before {
+            nfs::pre_op_attr::attributes(before) => {
+                assert_eq!(before.size, fs.attr.size);
+                assert_eq!(before.ctime.seconds, fs.attr.ctime.seconds);
+                assert_eq!(before.ctime.nseconds, fs.attr.ctime.nseconds);
+            },
+            nfs::pre_op_attr::Void => panic!("NOT_SYNC reply is missing pre-operation attributes"),
+        }
+        match wcc.after {
+            nfs::post_op_attr::attributes(after) => {
+                assert_eq!(after.size, fs.attr.size);
+                assert_eq!(after.ctime.seconds, fs.attr.ctime.seconds);
+                assert_eq!(after.ctime.nseconds, fs.attr.ctime.nseconds);
+            },
+            nfs::post_op_attr::Void => panic!("NOT_SYNC reply is missing post-operation attributes"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_setattr_handle_returns_required_wcc_data() {
+        let fs = Arc::new(SetattrGuardTestFs::new(true));
+        let context = test_context(Arc::clone(&fs));
+        let input = setattr_request(sattrguard3::Void);
+        let mut output = Vec::new();
+
+        nfsproc3_setattr(XID, &mut Cursor::new(input), &mut output, &context)
+            .await
+            .unwrap();
+
+        assert_eq!(fs.setattr_calls.load(Ordering::SeqCst), 0);
+        let (status, wcc) = decode_setattr_reply(&output);
+        assert_eq!(status, nfs::nfsstat3::NFS3ERR_BADHANDLE as u32);
+        assert!(matches!(wcc.before, nfs::pre_op_attr::Void));
+        assert!(matches!(wcc.after, nfs::post_op_attr::Void));
+    }
 }
