@@ -29,16 +29,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Install Rust 1.90
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust 1.90 as the default gate toolchain
         uses: dtolnay/rust-toolchain@1.90
         with:
-          components: clippy
-      - name: Lint
-        run: |
-          cargo clippy -r --verbose -- -D warnings # elevates warnings to errors
-      - name: Build and Test
-        run: |
-          cargo test --verbose --no-fail-fast --features "strict"
+          components: clippy,rustfmt
+      - name: Install fuzz runner
+        run: cargo install cargo-fuzz --locked
+      - name: Full repository gate
+        run: ./tests/run_ci.sh
       - name: Check Cargo.lock has no uncommitted changes
         run: |
           # the build and test steps would update Cargo.lock if it is out of date

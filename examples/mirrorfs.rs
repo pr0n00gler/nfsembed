@@ -13,7 +13,7 @@ use intaglio::Symbol;
 use nfsserve::fs_util::*;
 use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::legacy::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::debug;
@@ -170,7 +170,7 @@ impl FSMap {
                 cur_path.pop();
             }
             self.id_to_path.get_mut(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?.children =
-                Some(BTreeSet::from_iter(new_children.into_iter()));
+                Some(BTreeSet::from_iter(new_children));
         }
 
         Ok(())

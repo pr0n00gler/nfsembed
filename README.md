@@ -1,84 +1,82 @@
-Rust NFSv3 Server
-=================
-This is an incomplete but very functional implementation of an NFSv3 server
-in Rust.
+Embedded Rust NFSv3 Server
+==========================
 
-Why? You may ask. 
+`nfsserve` is an embeddable NFSv3-over-TCP server driven by an
+application-provided virtual filesystem. The application owns the Tokio
+runtime, listener, process lifecycle, signal handling, and operating-system
+mount execution.
 
-I wanted to implement a user-mode file-system mount that is truly cross-platform.
-What is a protocol that pretty much every OS supports? NFS.
+> Note: this is a fork of https://github.com/huggingface/nfsserve project with more tests + a lot of improvements.
 
-Why not FUSE you may ask:
-1. FUSE is annoying to users on Mac and Windows (drivers necessary).
-2. It takes a lot of care to build a FUSE driver for remote filesystems. 
-NFS clients however have a lot of historical robustification for
-slow-responding, or perhaps, never-responding servers. 
-3. The OS is pretty good at caching NFS. There are established principles for 
-cache eviction, for metadata, or for data. With a FUSE driver I have to do
-a lot of the work myself.
+The production target is native Linux and macOS NFSv3 clients using:
 
-So, this is a FUSE-like user-mode filesystem API that basically works by 
-creating a localhost NFSv3 server you can mount.
-
-This is used in [hf-mount](https://github.com/huggingface/hf-mount) to provide the `hf-mount`
-functionality.
-
-Run the Demo
-============
-To run the demofs, this will host an NFS server on localhost:11111
+```text
+vers=3,tcp,port=<port>,mountport=<port>
 ```
-cargo build --example demo --features demo
-./target/debug/examples/demo
-```
-
-To mount. On Linux (sudo may be required):
-```
-mkdir demo
-mount.nfs -o user,noacl,nolock,vers=3,tcp,wsize=1048576,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ demo
-```
-
-On Mac:
-```
-mkdir demo
-mount_nfs -o nolocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ demo
-```
-
-On Windows (Pro required as Home does not have NFS client):
-```
-mount.exe -o anon,nolock,mtype=soft,fileaccess=6,casesensitive,lang=ansi,rsize=128,wsize=128,timeout=60,retry=2 \\127.0.0.1\\ X:
-```
-
-Note that the demo filesystem is *writable*. 
 
 Usage
 =====
 
-You simply need to implement the vfs::NFSFileSystem
-trait. See demofs.rs for an example and bin/main.rs for how to actually start
-a service. The interface generally not difficult to implement; demanding mainly
-the ability to associate every file system object (directory/file) with a 64-bit
-ID. Directory listing can be a bit complicated due to the pagination requirements.
+Implement `vfs::VirtualFileSystem`, then construct a server without creating a
+runtime or binding a socket inside the library:
 
-TODO and Seeking Contributors
-=============================
- - Improve documentation
- - More things in Mount Protocol and NFS Protocol has to be implemented.
- There are a bunch of messages that reply as "Unavailable". For instance, 
- we implement `READDIR_PLUS` but not `READDIR` which is usually fine, except
- that Windows insists on always trying READDIR first. 
- Link creation is also not supported.
- - The RPC message handling in `nfs_handlers.rs` leaves a lot to be desired.
- The response serialization is very manual. Some cleanup will be good.
- - Windows mount "kinda" works (only on Windows 11 Pro with the NFS server),
- but prints a lot of garbage due to various unimplemented APIs. Windows 11
- somehow tries to poll with very old NFS protocols constantly.
- - Many many perf optimizations. 
- - Maybe pull in the mount command from [xet-core](https://github.com/huggingface/xet-core/blob/main/rust/gitxetcore/src/xetmnt/mod.rs)
- so the user does not need to remember the `-o` incantations above.
- - Maybe make an SMB3 implementation so we can work on Windows Home edition
- - NFSv4 has some write performance optimizations that would be quite nice.
- The protocol is a bit more involving to implement though as it is somewhat
- stateful.
+```rust,ignore
+use nfsserve::{AuthPolicy, NfsServer, ServerLimits};
+use tokio::net::TcpListener;
+
+let server = NfsServer::builder(vfs)
+    .export_name("virtual-fs")
+    .limits(ServerLimits::production_defaults())
+    .auth_policy(AuthPolicy::AuthSys)
+    .build()?;
+
+let listener = TcpListener::bind("127.0.0.1:0").await?;
+let handle = server.start(listener).await?;
+let mount_info = handle.mount_info();
+
+// The embedding application performs the OS mount.
+
+handle.shutdown().await?;
+handle.wait().await?;
+```
+
+Applications that want complete task ownership can use
+`server.serve(listener, shutdown_signal).await` instead.
+
+The VFS receives a `RequestContext` containing the authenticated principal,
+client address, and export ID. Object keys are wrapped in server-instance and
+export-scoped authenticated file handles; backends never parse raw NFS handles.
+Additional independent exports can be added with
+`NfsServerBuilder::add_export`; `ServerHandle::mount_infos` reports the bound
+mount data for every configured export.
+
+Scope
+=====
+
+The crate implements NFSv3 and MOUNTv3 over TCP. Optional minimal portmapper
+support is disabled by default. NFSv4, UDP, NLM, ACL side protocols,
+RPCSEC_GSS, mount execution, privilege elevation, and process lifecycle are
+outside its scope. Backend operations that are unavailable return the NFS-level
+`NFS3ERR_NOTSUPP` result.
+
+End-to-end tests
+================
+
+The repository includes a public-API TCP certification harness covering every
+NFSv3 procedure, MOUNTv3, replay, authentication, limits, lifecycle,
+adversarial inputs, observability, strict documentation and package builds, and
+cargo-fuzz smoke sessions. Run the full CI gate with:
+
+```sh
+./tests/run_ci.sh
+```
+
+See [`tests/README.md`](tests/README.md) for the coverage matrix and the
+network-disabled Linux container command. Privileged Linux/macOS native-client
+and automatically coordinated cross-host runners live under
+[`tests/native`](tests/native). Their persistent certification filesystem
+verifies mutation state, pagination, reconnect, restart, concurrency,
+read-only behavior, and case policy through real kernel clients.
 
 Relevant RFCs
 =============
@@ -90,17 +88,18 @@ Relevant RFCs
 
 Basic Source Layout
 ===================
- - context.rs: A connection context object that is passed around containing
- connection information, VFS information, etc.
- - xdr.rs: Serialization / Deserialization routines for XDR structures
- - tcp.rs: Main TCP handling entry point
- - rpcwire.rs: Reads and write RPC messages from a TCP socket and performs outer 
-               most RPC message decoding, redirecting to NFS/Mount/Portmapper 
-               implementations as needed.
- - rpc.rs: The structure of a RPC call and reply. All XDR encoded.
- - portmap.rs/portmap\_handlers.rs: The XDR structures required by the Portmapper protocol and the Portmapper RPC handlers.
- - mount.rs/mount\_handlers.rs: The XDR structures required by the Mount protocol and the Mount RPC handlers.
- - nfs.rs/nfs\_handlers.rs: The XDR structures required by the NFS protocol and the NFS RPC handlers.
+
+ - `server/`: builder, transport-aware limits, lifecycle handle, deadline-bound VFS execution, and byte-budgeted connection tasks.
+ - `rpc/`: bounded XDR primitives, authentication, and TCP record marking.
+ - `nfs3/`: NFSv3 types, procedure identities, and codec surface.
+ - `mount3/`: MOUNTv3 types and export matching.
+ - `portmap/`: optional minimal portmapper support.
+ - `vfs/`: request context, object and mutation types, and the VFS contract.
+ - `replay/`: count-, byte-, TTL-, and XID-generation-bounded duplicate-request reply cache.
+ - `handles/`: authenticated, instance-scoped file-handle encoding.
+
+The pre-1.0 implementation remains available only to the `demo` feature for
+example migration.
 
 
 More More Details Than Necessary
@@ -176,12 +175,9 @@ The MOUNT protocol provides a list of "exports", (in the simplest case. Just "/"
 and the client will request to MNT("/") which will return the handle of this 
 root directory.
 
-Normally the server can and do maintain a list of mounts which can be queried,
-and really the client can UMNT (unmount) as well.  But in our case we
-only implement MNT and EXPORT which suffices. NFS clients generally
-ignore the return message of UMNT as there is really nothing the
-client can do on a UMNT failure. As such our Mount protocol implementation
-is entirely stateless.
+The server maintains a bounded mount table per instance and implements `MNT`,
+`DUMP`, `UMNT`, `UMNTALL`, and `EXPORT`. Unmount procedures return the void
+MOUNTv3 result required by the protocol.
 
 NFS
 ---

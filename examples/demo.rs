@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use nfsserve::nfs::{self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
 use nfsserve::tcp::*;
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::legacy::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 #[derive(Debug, Clone)]
 enum FSContents {

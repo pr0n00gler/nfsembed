@@ -1,0 +1,41 @@
+name: Native NFSv3 clients
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  same-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nfs-common python3
+      - run: ./tests/native/run_local.sh
+
+  cross-host:
+    # Lima needs hardware virtualization. GitHub's macos-latest label is
+    # arm64, where nested virtualization is unavailable, so pin the supported
+    # Intel image for this cross-host certification job.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: lima-vm/lima-actions/setup@v1
+      - name: Start Linux certification VM
+        run: |
+          limactl start --name=linux --cpus=2 --memory=4 --port-forward "20490:20490,static=true" --tty=false template:default
+          rsync -a --delete -e ssh ./ lima-linux:/tmp/nfsserve/
+          ssh lima-linux 'sudo apt-get update && sudo apt-get install -y nfs-common curl python3'
+          ssh lima-linux 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+      - name: Linux server to macOS native client
+        run: ./tests/native/run_linux_server_macos_client_lima.sh
+      - name: macOS server to Linux native client
+        run: ./tests/native/run_macos_server_linux_client_lima.sh

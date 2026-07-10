@@ -10,7 +10,7 @@ use tracing::{debug, error, trace, warn};
 use crate::context::RPCContext;
 use crate::nfs;
 use crate::rpc::*;
-use crate::vfs::VFSCapabilities;
+use crate::vfs::legacy::VFSCapabilities;
 use crate::xdr::*;
 /*
 program NFS_PROGRAM {

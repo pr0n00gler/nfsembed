@@ -115,7 +115,7 @@ xdr_struct!(auth_unix, stamp, machinename, uid, gid, gids);
 ///authentication fields, the credentials and verifier.  The reply
 ///message has one authentication field, the response verifier.  The RPC
 ///protocol specification defines all three fields to be the following
-///opaque type (in the eXternal Data Representation (XDR) language [9]):
+///opaque type (in the eXternal Data Representation (XDR) language \[9\]):
 ///
 ///   In other words, any "opaque_auth" structure is an "auth_flavor"
 ///enumeration followed by bytes which are opaque to (uninterpreted by)

@@ -13,7 +13,7 @@ use tracing::{debug, error, info};
 use crate::context::RPCContext;
 use crate::rpcwire::*;
 use crate::transaction_tracker::TransactionTracker;
-use crate::vfs::NFSFileSystem;
+use crate::vfs::legacy::NFSFileSystem;
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {

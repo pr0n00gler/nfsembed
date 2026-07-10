@@ -1,6 +1,6 @@
 [package]
 name = "nfsserve"
-version = "0.11.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]
 description = "A Rust NFS Server implementation"
@@ -11,7 +11,7 @@ keywords = ["nfs"]
 license = "BSD-3-Clause"
 categories = ["network-programming", "filesystem"]
 publish = true
-include = ["src/**/*", "src/*", "Cargo.toml", "LICENSE", "README.md"]
+include = ["src/**/*", "src/*", "examples/**/*", "tests/**/*", "Cargo.toml", "LICENSE", "README.md"]
 
 
 [lib]
@@ -21,15 +21,23 @@ doctest = false
 byteorder = "1.4"
 num-traits = "0.2"
 num-derive = "0.4"
-tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros"], default-features = false }
+tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros", "time"], default-features = false }
 tracing = "0.1.31"
 anyhow = "1"
 async-trait = "0.1.9"
 filetime = "0.2"
+bytes = "1"
+hmac = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+thiserror = "1"
 
 # demo
 tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
 intaglio = { version = "1.6", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [features]
 strict = []
@@ -45,3 +53,7 @@ path = "examples/demo.rs"
 name = "mirrorfs"
 required-features = ["demo"]
 path = "examples/mirrorfs.rs"
+
+[[example]]
+name = "certification_server"
+path = "examples/certification_server.rs"
