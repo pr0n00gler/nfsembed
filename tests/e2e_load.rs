@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 use nfsserve::rpc::codec::Encoder;
 use nfsserve::server::{AuthPolicy, PortmapperMode, ServerLimits};
 use nfsserve::vfs::ExportId;
-use tokio::sync::Barrier;
-use tokio::time::timeout;
-
 use support::rpc::{mount_root, nfs_args_handle, nfs_payload, start_server_with, RpcClient, NFS_PROGRAM, NFS_VERSION};
 use support::vfs::ConformanceVfs;
+use tokio::sync::Barrier;
+use tokio::time::timeout;
 
 #[cfg(target_os = "linux")]
 fn resident_memory_kib() -> Option<u64> {

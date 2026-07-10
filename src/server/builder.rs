@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use crate::vfs::{ExportId, VirtualFileSystem};
-
 use super::{AuthPolicy, ExportState, NfsServer, PortmapperMode, ServerError, ServerLimits};
+use crate::vfs::{ExportId, VirtualFileSystem};
 
 pub struct NfsServerBuilder {
     pub(crate) exports: Vec<ExportState>,

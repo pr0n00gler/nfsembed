@@ -8,6 +8,11 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+pub use builder::NfsServerBuilder;
+pub use config::{AuthPolicy, PortmapperMode};
+use connection::{serve_connection, ConnectionState};
+pub use handle::{MountInfo, ServerHandle};
+pub use limits::ServerLimits;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::{JoinError, JoinSet};
@@ -18,13 +23,6 @@ use crate::replay::{ReplayCache, ReplayError};
 use crate::rpc::codec::{DecodeError, EncodeError};
 use crate::rpc::record::RecordError;
 use crate::vfs::VirtualFileSystem;
-
-pub use builder::NfsServerBuilder;
-pub use config::{AuthPolicy, PortmapperMode};
-pub use handle::{MountInfo, ServerHandle};
-pub use limits::ServerLimits;
-
-use connection::{serve_connection, ConnectionState};
 
 pub(crate) struct ExecutionTracker {
     tasks: Mutex<JoinSet<()>>,
@@ -274,14 +272,13 @@ mod tests {
     use async_trait::async_trait;
     use tokio::net::{TcpListener, TcpStream};
 
+    use super::*;
     use crate::rpc::codec::{Decoder, Encoder};
     use crate::rpc::record::{read_record, write_record, RecordLimits};
     use crate::vfs::{
         CreatedObject, FileAttributes, FileType, NfsError, NfsName, NfsTime, ObjectKey, RequestContext,
         VfsCapabilities, VirtualFileSystem,
     };
-
-    use super::*;
 
     struct TestVfs {
         root_id: u64,

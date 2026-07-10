@@ -6,7 +6,6 @@ mod types;
 pub mod legacy;
 
 use async_trait::async_trait;
-
 pub use capabilities::VfsCapabilities;
 pub use context::{ExportId, Principal, RequestContext};
 pub use types::*;

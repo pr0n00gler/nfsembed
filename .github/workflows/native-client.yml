@@ -5,9 +5,10 @@ on:
   pull_request:
     branches:
       - master
-      - feat/refactoring
   push:
-    branches: [main]
+    branches:
+      - main
+      - feat/refactoring
 
 jobs:
   same-host:

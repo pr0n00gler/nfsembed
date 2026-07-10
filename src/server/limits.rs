@@ -128,12 +128,11 @@ impl Default for ServerLimits {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::nfs3::codec::EncodeNfsResult;
     use crate::nfs3::procedures::CreateResult;
     use crate::rpc::codec::Encoder;
     use crate::vfs::{FileAttributes, FileType, NfsTime, WccAttributes};
-
-    use super::*;
 
     #[test]
     fn mutation_reply_bound_covers_the_largest_complete_union_arm() {

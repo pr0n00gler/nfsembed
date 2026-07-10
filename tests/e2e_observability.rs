@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use nfsserve::rpc::codec::Encoder;
 use nfsserve::vfs::ExportId;
-use tracing_subscriber::fmt::MakeWriter;
-
 use support::rpc::{
     mount_root, nfs_args_directory, nfs_args_handle, start_server, RpcClient, NFS_PROGRAM, NFS_VERSION,
 };
 use support::vfs::ConformanceVfs;
+use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone)]
 struct BufferWriter {
