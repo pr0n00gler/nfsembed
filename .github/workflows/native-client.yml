@@ -3,6 +3,9 @@ name: Native NFSv3 clients
 on:
   workflow_dispatch:
   pull_request:
+    branches:
+      - master
+      - feat/refactoring
   push:
     branches: [main]
 
