@@ -32,10 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: lima-vm/lima-actions/setup@v1
+      - name: Install Lima
+        run: brew install lima
       - name: Start Linux certification VM
         run: |
           limactl start --name=linux --cpus=2 --memory=4 --port-forward "20490:20490,static=true" --tty=false template:default
+          mkdir -p ~/.ssh
+          printf 'Include ~/.lima/*/ssh.config\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
           rsync -a --delete -e ssh ./ lima-linux:/tmp/nfsserve/
           ssh lima-linux 'sudo apt-get update && sudo apt-get install -y nfs-common curl python3'
           ssh lima-linux 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
