@@ -4,6 +4,7 @@ pub mod message;
 #[cfg(feature = "demo")]
 mod message_legacy;
 pub mod record;
+pub mod reply;
 
 #[cfg(feature = "demo")]
 pub use message_legacy::*;

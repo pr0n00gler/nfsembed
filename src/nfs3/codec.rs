@@ -378,6 +378,32 @@ pub fn encode_readdir_entry(encoder: &mut Encoder, entry: &ReadDirEntry) -> Resu
 /// status discriminant as required by RFC 1813. Returns `false` when even the
 /// empty success shape cannot fit.
 pub fn truncate_readdir_result(result: &mut ReadDirResult, max_size: usize) -> Result<bool, EncodeError> {
+    // Encode the complete result once, then subtract each removed entry's
+    // independent XDR representation. This preserves the old truncation
+    // policy without repeatedly encoding the entire remaining directory.
+    let mut encoder = Encoder::new();
+    result.encode_result(&mut encoder)?;
+    let mut encoded_size = encoder.len().saturating_sub(4);
+    if encoded_size <= max_size {
+        return Ok(true);
+    }
+    let ReadDirResult::Ok { entries, eof, .. } = result else {
+        return Ok(false);
+    };
+    while encoded_size > max_size {
+        let Some(removed) = entries.pop() else {
+            return Ok(false);
+        };
+        let mut removed_encoder = Encoder::new();
+        encode_readdir_entry(&mut removed_encoder, &removed)?;
+        encoded_size = encoded_size.saturating_sub(removed_encoder.len());
+        *eof = false;
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+fn truncate_readdir_result_reference(result: &mut ReadDirResult, max_size: usize) -> Result<bool, EncodeError> {
     loop {
         let mut encoder = Encoder::new();
         result.encode_result(&mut encoder)?;
@@ -575,5 +601,31 @@ mod tests {
             encode_getattr_for_test(&GetAttrResult::Ok { attributes }),
             Err(EncodeError::InvalidTime { .. })
         ));
+    }
+
+    #[test]
+    fn linear_readdir_truncation_matches_reference_policy() {
+        let template = ReadDirResult::Ok {
+            directory_attributes: None,
+            verifier: [3; 8],
+            entries: (0..32)
+                .map(|index| ReadDirEntry {
+                    file_id: index,
+                    name: vec![b'x'; index as usize % 13 + 1],
+                    cookie: index + 1,
+                    extension: ReadDirEntryExtension::Basic,
+                })
+                .collect(),
+            eof: true,
+        };
+        for limit in (0..=1400).step_by(7) {
+            let mut actual = template.clone();
+            let mut expected = template.clone();
+            assert_eq!(
+                truncate_readdir_result(&mut actual, limit).unwrap(),
+                truncate_readdir_result_reference(&mut expected, limit).unwrap()
+            );
+            assert_eq!(actual, expected);
+        }
     }
 }

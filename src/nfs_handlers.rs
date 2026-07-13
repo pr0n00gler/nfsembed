@@ -886,6 +886,9 @@ pub async fn nfsproc3_readdirplus(
             nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
             dir_attr.serialize(&mut counting_output)?;
             dirversion.serialize(&mut counting_output)?;
+            // Directory pages may contain many entries, so retain this
+            // scratch allocation instead of reallocating it per entry.
+            let mut write_buf = Vec::with_capacity(256);
             for entry in result.entries {
                 let obj_attr = entry.attr;
                 let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
@@ -898,7 +901,7 @@ pub async fn nfsproc3_readdirplus(
                     name_handle: handle,
                 };
                 // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
+                write_buf.clear();
                 let mut write_cursor = std::io::Cursor::new(&mut write_buf);
                 // true flag for the entryplus3* to mark that this contains an entry
                 true.serialize(&mut write_cursor)?;
@@ -1010,6 +1013,9 @@ pub async fn nfsproc3_readdir(
             nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
             dir_attr.serialize(&mut counting_output)?;
             dirversion.serialize(&mut counting_output)?;
+            // Reuse one scratch buffer for the whole page; `clear` preserves
+            // capacity while each entry is measured and emitted.
+            let mut write_buf = Vec::with_capacity(128);
             for entry in result.entries {
                 let entry = entry3 {
                     fileid: entry.fileid,
@@ -1017,7 +1023,7 @@ pub async fn nfsproc3_readdir(
                     cookie: entry.fileid,
                 };
                 // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
+                write_buf.clear();
                 let mut write_cursor = std::io::Cursor::new(&mut write_buf);
                 // true flag for the entryplus3* to mark that this contains an entry
                 true.serialize(&mut write_cursor)?;

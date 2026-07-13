@@ -1,5 +1,7 @@
 use std::fmt;
 
+use bytes::Bytes;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ObjectKey {
     pub file_id: u64,
@@ -25,6 +27,11 @@ impl NfsName {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Consumes the name and returns its validated storage without copying.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
     }
 }
 
@@ -137,6 +144,25 @@ pub struct ReadResult {
     pub data: Vec<u8>,
     pub eof: bool,
     pub attributes: Option<FileAttributes>,
+}
+
+/// A read result whose payload can share storage with a backend cache, mmap,
+/// or other immutable byte owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadBytesResult {
+    pub data: Bytes,
+    pub eof: bool,
+    pub attributes: Option<FileAttributes>,
+}
+
+impl From<ReadResult> for ReadBytesResult {
+    fn from(result: ReadResult) -> Self {
+        Self {
+            data: Bytes::from(result.data),
+            eof: result.eof,
+            attributes: result.attributes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,5 +284,22 @@ pub enum NfsError {
 impl fmt::Display for NfsName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", String::from_utf8_lossy(&self.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vec_read_result_converts_to_bytes_without_copying() {
+        let data = vec![0x44; 1024];
+        let pointer = data.as_ptr();
+        let result = ReadBytesResult::from(ReadResult {
+            data,
+            eof: true,
+            attributes: None,
+        });
+        assert_eq!(result.data.as_ptr(), pointer);
     }
 }

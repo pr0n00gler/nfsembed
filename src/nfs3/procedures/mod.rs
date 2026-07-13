@@ -2,6 +2,8 @@
 //! and finished as one typed value before semantic handle/name validation,
 //! and every result is constructed before it is encoded.
 
+use bytes::Bytes;
+
 use crate::nfs3::types::{FileAttributes, FsInfo, FsStat, NfsStatus, PathConf, WccData, WriteStability};
 use crate::rpc::codec::{DecodeError, Decoder};
 use crate::vfs::{CreateMode, NfsTime, NodeType, SetAttributes, SetTime};
@@ -60,11 +62,69 @@ pub struct WriteArgs {
 
 impl WriteArgs {
     pub fn validate(&self) -> Result<(), NfsStatus> {
-        if usize::try_from(self.count).ok() != Some(self.data.len()) {
-            Err(NfsStatus::Invalid)
-        } else {
-            Ok(())
+        validate_write_count(self.count, self.data.len())
+    }
+}
+
+/// Server-oriented WRITE arguments whose data is a zero-copy slice of the
+/// retained RPC record. `WriteArgs` remains available for callers decoding
+/// from a borrowed byte slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteRequest {
+    pub object: FileHandle,
+    pub offset: u64,
+    pub count: u32,
+    pub requested: WriteStability,
+    pub data: Bytes,
+}
+
+impl WriteRequest {
+    pub fn decode(input: Bytes, max_variable_size: usize) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(&input);
+        let object = decode_handle(&mut decoder)?;
+        let offset = decoder.read_u64()?;
+        let count = decoder.read_u32()?;
+        let requested = decode_stability(&mut decoder)?;
+        let data_prefix = decoder.position();
+        let data_len = decoder.read_opaque_slice("WRITE data", max_variable_size)?.len();
+        decoder.finish()?;
+        // `read_opaque_slice` validates the length, padding, and trailing
+        // bytes. Reconstructing that validated range as a `Bytes` slice keeps
+        // the RPC record alive across the asynchronous VFS call without a
+        // payload copy.
+        let data_start = data_prefix.checked_add(4).ok_or(DecodeError::Overflow)?;
+        let data_end = data_start.checked_add(data_len).ok_or(DecodeError::Overflow)?;
+        Ok(Self {
+            object,
+            offset,
+            count,
+            requested,
+            data: input.slice(data_start..data_end),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), NfsStatus> {
+        validate_write_count(self.count, self.data.len())
+    }
+}
+
+impl From<WriteArgs> for WriteRequest {
+    fn from(arguments: WriteArgs) -> Self {
+        Self {
+            object: arguments.object,
+            offset: arguments.offset,
+            count: arguments.count,
+            requested: arguments.requested,
+            data: Bytes::from(arguments.data),
         }
+    }
+}
+
+fn validate_write_count(count: u32, data_len: usize) -> Result<(), NfsStatus> {
+    if usize::try_from(count).ok() != Some(data_len) {
+        Err(NfsStatus::Invalid)
+    } else {
+        Ok(())
     }
 }
 
@@ -560,4 +620,29 @@ pub enum PathConfResult {
 pub enum CommitResult {
     Ok { file_wcc: WccData, verifier: [u8; 8] },
     Err { status: NfsStatus, file_wcc: WccData },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::codec::Encoder;
+
+    #[test]
+    fn write_request_data_shares_the_rpc_record() {
+        let payload = vec![0x5a; 1024];
+        let mut encoder = Encoder::new();
+        encoder.write_opaque(&[0x11; 45]).unwrap();
+        encoder.write_u64(7);
+        encoder.write_u32(payload.len() as u32);
+        encoder.write_u32(2);
+        encoder.write_opaque(&payload).unwrap();
+        let record = Bytes::from(encoder.into_bytes());
+        let arguments = WriteRequest::decode(record.clone(), payload.len()).unwrap();
+        assert_eq!(arguments.data, payload);
+        let record_start = record.as_ptr() as usize;
+        let record_end = record_start + record.len();
+        let data_start = arguments.data.as_ptr() as usize;
+        assert!((record_start..record_end).contains(&data_start));
+        arguments.validate().unwrap();
+    }
 }

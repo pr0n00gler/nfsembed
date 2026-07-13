@@ -17,7 +17,9 @@ const _: () = assert!(HANDLE_SIZE <= 64);
 #[derive(Clone)]
 pub struct HandleCodec {
     instance_id: [u8; INSTANCE_SIZE],
-    secret: [u8; 32],
+    // Keep the keyed HMAC state initialized; cloning it is cheaper than
+    // rebuilding the key schedule for every handle encode or verification.
+    mac: HmacSha256,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -44,7 +46,8 @@ impl HandleCodec {
         let mut secret = [0; 32];
         OsRng.try_fill_bytes(&mut instance_id)?;
         OsRng.try_fill_bytes(&mut secret)?;
-        Ok(Self { instance_id, secret })
+        let mac = HmacSha256::new_from_slice(&secret).expect("HMAC accepts any key size");
+        Ok(Self { instance_id, mac })
     }
 
     pub fn encode(&self, export_id: ExportId, object: ObjectKey) -> [u8; HANDLE_SIZE] {
@@ -78,7 +81,7 @@ impl HandleCodec {
             return Err(HandleError::StaleInstance);
         }
         let encoded_export = u32::from_be_bytes(handle[9..13].try_into().map_err(|_| HandleError::InvalidLength)?);
-        let mut mac = HmacSha256::new_from_slice(&self.secret).map_err(|_| HandleError::InvalidTag)?;
+        let mut mac = self.mac.clone();
         mac.update(&handle[..PAYLOAD_SIZE]);
         mac.verify_truncated_left(&handle[PAYLOAD_SIZE..])
             .map_err(|_| HandleError::InvalidTag)?;
@@ -92,7 +95,7 @@ impl HandleCodec {
     }
 
     fn tag(&self, payload: &[u8]) -> [u8; TAG_SIZE] {
-        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key size");
+        let mut mac = self.mac.clone();
         mac.update(payload);
         let bytes = mac.finalize().into_bytes();
         let mut tag = [0; TAG_SIZE];

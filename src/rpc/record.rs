@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, IoSlice};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,9 +50,7 @@ pub async fn read_record<R: AsyncRead + Unpin>(reader: &mut R, limits: RecordLim
                 limit: limits.max_record_size,
             });
         }
-        record.try_reserve_exact(length).map_err(|_| RecordError::RecordTooLarge {
-            limit: limits.max_record_size,
-        })?;
+        reserve_record(&mut record, new_length, limits.max_record_size)?;
         let start = record.len();
         record.resize(new_length, 0);
         reader.read_exact(&mut record[start..]).await?;
@@ -123,9 +121,7 @@ pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
                 limit: limits.max_record_size,
             });
         }
-        record.try_reserve_exact(length).map_err(|_| RecordError::RecordTooLarge {
-            limit: limits.max_record_size,
-        })?;
+        reserve_record(&mut record, new_length, limits.max_record_size)?;
         let start = record.len();
         record.resize(new_length, 0);
         reader.read_exact(&mut record[start..]).await?;
@@ -142,6 +138,19 @@ pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
     Err(RecordError::TooManyFragments {
         limit: limits.max_fragments,
     })
+}
+
+/// Grows geometrically for fragmented records while never requesting a
+/// capacity above the validated record-size limit. This avoids reallocating
+/// and copying the full prefix for every fragment.
+fn reserve_record(record: &mut Vec<u8>, required: usize, limit: usize) -> Result<(), RecordError> {
+    if required <= record.capacity() {
+        return Ok(());
+    }
+    let target = record.capacity().saturating_mul(2).max(required).min(limit);
+    record
+        .try_reserve_exact(target.saturating_sub(record.len()))
+        .map_err(|_| RecordError::RecordTooLarge { limit })
 }
 
 pub async fn write_record<W: AsyncWrite + Unpin>(
@@ -172,18 +181,40 @@ pub async fn write_record_limited<W: AsyncWrite + Unpin>(
     write_fragments(writer, record, limits.max_fragment_size).await
 }
 
+/// Writes a record held in up to three immutable segments without first
+/// coalescing them. Fragment boundaries may cross segment boundaries.
+pub async fn write_record_segments_limited<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    segments: [&[u8]; 3],
+    limits: RecordLimits,
+) -> Result<(), RecordError> {
+    let length = segments.iter().try_fold(0usize, |length, segment| {
+        length.checked_add(segment.len()).ok_or(RecordError::RecordTooLarge {
+            limit: limits.max_record_size,
+        })
+    })?;
+    validate_record_length(length, limits)?;
+    write_segmented_fragments(writer, segments, length, limits.max_fragment_size).await
+}
+
 pub fn validate_record(record: &[u8], limits: RecordLimits) -> Result<(), RecordError> {
-    if record.len() > limits.max_record_size {
+    validate_record_length(record.len(), limits)
+}
+
+/// Validates an outbound record when its payload is segmented and therefore
+/// has no single contiguous slice.
+pub fn validate_record_length(length: usize, limits: RecordLimits) -> Result<(), RecordError> {
+    if length > limits.max_record_size {
         return Err(RecordError::RecordTooLarge {
             limit: limits.max_record_size,
         });
     }
-    let fragment_count = if record.is_empty() {
+    let fragment_count = if length == 0 {
         1
     } else if limits.max_fragment_size == 0 {
         usize::MAX
     } else {
-        record.len().div_ceil(limits.max_fragment_size)
+        length.div_ceil(limits.max_fragment_size)
     };
     if fragment_count > limits.max_fragments {
         return Err(RecordError::TooManyFragments {
@@ -192,9 +223,98 @@ pub fn validate_record(record: &[u8], limits: RecordLimits) -> Result<(), Record
     }
     if limits.max_fragment_size == 0 {
         return Err(RecordError::FragmentTooLarge {
-            actual: record.len(),
+            actual: length,
             limit: 0,
         });
+    }
+    Ok(())
+}
+
+async fn write_segmented_fragments<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    segments: [&[u8]; 3],
+    total_length: usize,
+    max_fragment_size: usize,
+) -> Result<(), RecordError> {
+    if total_length == 0 {
+        writer.write_all(&0x8000_0000u32.to_be_bytes()).await?;
+        return Ok(());
+    }
+    let mut segment_index = 0usize;
+    let mut segment_offset = 0usize;
+    let mut remaining_total = total_length;
+    while remaining_total > 0 {
+        let fragment_length = remaining_total.min(max_fragment_size);
+        if fragment_length > 0x7fff_ffff {
+            return Err(RecordError::FragmentTooLarge {
+                actual: fragment_length,
+                limit: 0x7fff_ffff,
+            });
+        }
+        let last = fragment_length == remaining_total;
+        let header = (fragment_length as u32 | if last { 0x8000_0000 } else { 0 }).to_be_bytes();
+        let mut slices = [IoSlice::new(&[]); 4];
+        slices[0] = IoSlice::new(&header);
+        let mut slice_count = 1usize;
+        let mut current_index = segment_index;
+        let mut current_offset = segment_offset;
+        let mut remaining_fragment = fragment_length;
+        while remaining_fragment > 0 {
+            while current_index < segments.len() && current_offset == segments[current_index].len() {
+                current_index += 1;
+                current_offset = 0;
+            }
+            let segment = segments
+                .get(current_index)
+                .ok_or(RecordError::RecordTooLarge { limit: total_length })?;
+            let take = remaining_fragment.min(segment.len() - current_offset);
+            slices[slice_count] = IoSlice::new(&segment[current_offset..current_offset + take]);
+            slice_count += 1;
+            remaining_fragment -= take;
+            current_offset += take;
+        }
+        write_all_slices(writer, &mut slices[..slice_count]).await?;
+        advance_segments(&segments, &mut segment_index, &mut segment_offset, fragment_length);
+        remaining_total -= fragment_length;
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
+fn advance_segments(segments: &[&[u8]], index: &mut usize, offset: &mut usize, mut count: usize) {
+    // Advance the persistent cursor by exactly the payload bytes written for
+    // one fragment. The record-marking header is intentionally not counted.
+    while count > 0 {
+        while *index < segments.len() && *offset == segments[*index].len() {
+            *index += 1;
+            *offset = 0;
+        }
+        let available = segments[*index].len() - *offset;
+        let take = available.min(count);
+        *offset += take;
+        count -= take;
+    }
+}
+
+async fn write_all_slices<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut slices: &mut [IoSlice<'_>],
+) -> Result<(), RecordError> {
+    if writer.is_write_vectored() {
+        // Async writers may consume only an arbitrary prefix of the iovec.
+        // Advance the slices in place so retries neither duplicate the header
+        // nor skip payload bytes.
+        while !slices.is_empty() {
+            let written = writer.write_vectored(slices).await?;
+            if written == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero).into());
+            }
+            IoSlice::advance_slices(&mut slices, written);
+        }
+    } else {
+        for slice in slices {
+            writer.write_all(slice).await?;
+        }
     }
     Ok(())
 }
@@ -228,8 +348,9 @@ async fn write_fragments<W: AsyncWrite + Unpin>(
             limit: 0x7fff_ffff,
         })?;
         let header = length | if end { 0x8000_0000 } else { 0 };
-        writer.write_all(&header.to_be_bytes()).await?;
-        writer.write_all(fragment).await?;
+        let header = header.to_be_bytes();
+        let mut slices = [IoSlice::new(&header), IoSlice::new(fragment)];
+        write_all_slices(writer, &mut slices).await?;
     }
     writer.flush().await?;
     Ok(())
@@ -237,7 +358,58 @@ async fn write_fragments<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use super::*;
+
+    // A deterministic short-writing sink that exercises the iovec retry path
+    // without relying on operating-system socket buffer pressure.
+    struct PartialVectoredWriter {
+        output: Vec<u8>,
+        max_write: usize,
+        vectored_writes: usize,
+    }
+
+    impl AsyncWrite for PartialVectoredWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _context: &mut Context<'_>, buffer: &[u8]) -> Poll<io::Result<usize>> {
+            let written = buffer.len().min(self.max_write);
+            self.output.extend_from_slice(&buffer[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffers: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut remaining = self.max_write;
+            let mut written = 0usize;
+            for buffer in buffers {
+                let take = buffer.len().min(remaining);
+                self.output.extend_from_slice(&buffer[..take]);
+                written += take;
+                remaining -= take;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            self.vectored_writes += 1;
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn multi_fragment_round_trip() {
@@ -255,6 +427,33 @@ mod tests {
         .unwrap();
         write.await.unwrap();
         assert_eq!(value, b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn partial_vectored_writes_preserve_fragmented_wire_bytes() {
+        let segments = [&b"ab"[..], &b"cdefg"[..], &b"hijk"[..]];
+        let limits = RecordLimits {
+            max_record_size: 11,
+            max_fragment_size: 5,
+            max_fragments: 3,
+        };
+        let mut writer = PartialVectoredWriter {
+            output: Vec::new(),
+            max_write: 3,
+            vectored_writes: 0,
+        };
+
+        write_record_segments_limited(&mut writer, segments, limits).await.unwrap();
+
+        let mut expected = Vec::new();
+        for (index, fragment) in b"abcdefghijk".chunks(5).enumerate() {
+            let last = index == 2;
+            let header = fragment.len() as u32 | if last { 0x8000_0000 } else { 0 };
+            expected.extend_from_slice(&header.to_be_bytes());
+            expected.extend_from_slice(fragment);
+        }
+        assert_eq!(writer.output, expected);
+        assert!(writer.vectored_writes > 3);
     }
 
     #[tokio::test]
@@ -394,5 +593,56 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, RecordError::TooManyFragments { limit: 2 }));
+
+        output.clear();
+        write_record_limited(
+            &mut output,
+            b"12345",
+            RecordLimits {
+                max_record_size: 5,
+                max_fragment_size: 2,
+                max_fragments: 3,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            output,
+            [
+                2u32.to_be_bytes().as_slice(),
+                b"12",
+                2u32.to_be_bytes().as_slice(),
+                b"34",
+                0x8000_0001u32.to_be_bytes().as_slice(),
+                b"5",
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_records_cross_segment_and_fragment_boundaries() {
+        let mut output = Vec::new();
+        write_record_segments_limited(
+            &mut output,
+            [b"abc", b"defgh", b"ij"],
+            RecordLimits {
+                max_record_size: 10,
+                max_fragment_size: 4,
+                max_fragments: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let expected = [
+            4u32.to_be_bytes().as_slice(),
+            b"abcd",
+            4u32.to_be_bytes().as_slice(),
+            b"efgh",
+            0x8000_0002u32.to_be_bytes().as_slice(),
+            b"ij",
+        ]
+        .concat();
+        assert_eq!(output, expected);
     }
 }

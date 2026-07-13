@@ -81,8 +81,15 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn read_opaque(&mut self, field: &'static str, limit: usize) -> Result<Vec<u8>, DecodeError> {
+        Ok(self.read_opaque_slice(field, limit)?.to_vec())
+    }
+
+    /// Reads a variable-length opaque value without copying it out of the
+    /// decoder input. Callers that only inspect a value should prefer this to
+    /// `read_opaque`.
+    pub fn read_opaque_slice(&mut self, field: &'static str, limit: usize) -> Result<&'a [u8], DecodeError> {
         let length = self.read_length(field, limit)?;
-        let value = self.take(length)?.to_vec();
+        let value = self.take(length)?;
         let padding = (4usize.wrapping_sub(length & 3)) & 3;
         if self.take(padding)?.iter().any(|byte| *byte != 0) {
             return Err(DecodeError::InvalidPadding);
@@ -142,6 +149,14 @@ pub struct Encoder {
 impl Encoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an encoder with room for a known fixed protocol prefix or
+    /// bounded reply, avoiding geometric growth for predictable messages.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            output: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn write_u32(&mut self, value: u32) {

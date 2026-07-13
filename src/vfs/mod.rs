@@ -68,6 +68,20 @@ pub trait VirtualFileSystem: Send + Sync + 'static {
         Err(NfsError::NotSupported)
     }
 
+    /// Zero-copy read extension. Existing implementations only need to
+    /// implement `read`; converting its `Vec` result into `Bytes` transfers
+    /// ownership without copying. Backends with immutable shared storage can
+    /// override this method directly.
+    async fn read_bytes(
+        &self,
+        context: &RequestContext,
+        object: ObjectKey,
+        offset: u64,
+        count: u32,
+    ) -> Result<ReadBytesResult, NfsError> {
+        self.read(context, object, offset, count).await.map(Into::into)
+    }
+
     async fn write(
         &self,
         _context: &RequestContext,

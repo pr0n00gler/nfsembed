@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
+use crate::rpc::reply::EncodedReply;
 use crate::vfs::ExportId;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -20,8 +22,8 @@ pub struct RequestFingerprint(pub [u8; 32]);
 
 pub enum ReplayDecision {
     Execute(ReplayLease),
-    Replay(Bytes),
-    Wait(oneshot::Receiver<Result<Bytes, ReplayError>>),
+    Replay(EncodedReply),
+    Wait(oneshot::Receiver<Result<EncodedReply, ReplayError>>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -47,10 +49,11 @@ struct LatestGeneration {
 
 enum ReplayState {
     InFlight {
-        waiters: Vec<oneshot::Sender<Result<Bytes, ReplayError>>>,
+        waiters: Vec<oneshot::Sender<Result<EncodedReply, ReplayError>>>,
     },
     Completed {
-        encoded_reply: Bytes,
+        encoded_reply: EncodedReply,
+        retained_bytes: usize,
         completed_at: Instant,
     },
 }
@@ -64,7 +67,8 @@ pub struct ReplayLease {
 }
 
 impl ReplayLease {
-    pub fn complete(mut self, reply: Bytes) {
+    pub fn complete(mut self, reply: impl Into<EncodedReply>) {
+        let reply = reply.into();
         self.cache.complete(&self.key, reply);
         self.finished = true;
     }
@@ -93,6 +97,7 @@ pub struct ReplayCache {
 struct CacheInner {
     entries: HashMap<ReplayEntryKey, ReplayState>,
     latest: HashMap<ReplayKey, LatestGeneration>,
+    completed_order: VecDeque<ReplayEntryKey>,
     completed_bytes: usize,
     next_generation: u64,
 }
@@ -106,6 +111,7 @@ impl ReplayCache {
             inner: Mutex::new(CacheInner {
                 entries: HashMap::new(),
                 latest: HashMap::new(),
+                completed_order: VecDeque::new(),
                 completed_bytes: 0,
                 next_generation: 0,
             }),
@@ -176,7 +182,18 @@ impl ReplayCache {
     }
 
     /// Stores the reply before callers attempt socket delivery.
-    fn complete(&self, key: &ReplayEntryKey, reply: Bytes) {
+    fn complete(&self, key: &ReplayEntryKey, reply: EncodedReply) {
+        let cacheable_wire_size = reply.len() <= self.max_completed_bytes;
+        // Unknown `Bytes` owners must be compacted before retention. Check
+        // generation eligibility first so an already-stale large READ cannot
+        // force a payload-sized copy. The second check under the lock below is
+        // still required because XID reuse can race the copy.
+        let eligible_before_copy = cacheable_wire_size
+            && (!reply.replay_storage_requires_copy() || {
+                let inner = self.inner();
+                Self::is_latest(&inner, key) && matches!(inner.entries.get(key), Some(ReplayState::InFlight { .. }))
+            });
+        let replay_storage = eligible_before_copy.then(|| reply.replay_storage());
         let mut inner = self.inner();
         let waiters = match inner.entries.remove(key) {
             Some(ReplayState::InFlight { waiters }) => waiters,
@@ -188,22 +205,29 @@ impl ReplayCache {
         };
         let is_latest = Self::is_latest(&inner, key);
         let mut retained = false;
-        if is_latest && reply.len() <= self.max_completed_bytes {
-            while inner.completed_bytes.saturating_add(reply.len()) > self.max_completed_bytes {
-                if !Self::evict_oldest_completed(&mut inner) {
-                    break;
+        if let (true, Some((encoded_reply, retained_bytes))) = (is_latest, replay_storage) {
+            // Reject a single over-budget backing allocation before eviction;
+            // otherwise an uncacheable reply could flush useful entries.
+            if retained_bytes <= self.max_completed_bytes {
+                while inner.completed_bytes.saturating_add(retained_bytes) > self.max_completed_bytes {
+                    if !Self::evict_oldest_completed(&mut inner) {
+                        break;
+                    }
                 }
-            }
-            if inner.completed_bytes.saturating_add(reply.len()) <= self.max_completed_bytes {
-                inner.completed_bytes = inner.completed_bytes.saturating_add(reply.len());
-                inner.entries.insert(
-                    key.clone(),
-                    ReplayState::Completed {
-                        encoded_reply: reply.clone(),
-                        completed_at: Instant::now(),
-                    },
-                );
-                retained = true;
+                if inner.completed_bytes.saturating_add(retained_bytes) <= self.max_completed_bytes {
+                    inner.completed_bytes = inner.completed_bytes.saturating_add(retained_bytes);
+                    inner.entries.insert(
+                        key.clone(),
+                        ReplayState::Completed {
+                            encoded_reply,
+                            retained_bytes,
+                            completed_at: Instant::now(),
+                        },
+                    );
+                    inner.completed_order.push_back(key.clone());
+                    Self::compact_completion_order(&mut inner);
+                    retained = true;
+                }
             }
         }
         if is_latest && !retained {
@@ -249,37 +273,44 @@ impl ReplayCache {
     }
 
     fn expire(inner: &mut CacheInner, now: Instant, ttl: Duration) {
-        let expired = inner
-            .entries
-            .iter()
-            .filter_map(|(key, state)| match state {
-                ReplayState::Completed { completed_at, .. } if now.duration_since(*completed_at) >= ttl => {
-                    Some(key.clone())
+        loop {
+            let Some(oldest) = inner.completed_order.front() else {
+                return;
+            };
+            match inner.entries.get(oldest) {
+                Some(ReplayState::Completed { completed_at, .. }) if now.duration_since(*completed_at) < ttl => {
+                    return;
                 },
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for key in expired {
-            Self::remove_completed(inner, &key);
+                Some(ReplayState::Completed { .. }) => {
+                    let oldest = inner.completed_order.pop_front().expect("front entry exists");
+                    Self::remove_completed(inner, &oldest);
+                },
+                // Entries removed because of XID reuse or byte-pressure
+                // eviction leave a cheap tombstone in the order queue.
+                Some(ReplayState::InFlight { .. }) | None => {
+                    inner.completed_order.pop_front();
+                },
+            }
         }
     }
 
     fn remove_completed_for_request(inner: &mut CacheInner, request: &ReplayKey) {
-        let completed = inner
-            .entries
-            .iter()
-            .filter_map(|(key, state)| {
-                (&key.request == request && matches!(state, ReplayState::Completed { .. })).then_some(key.clone())
-            })
-            .collect::<Vec<_>>();
-        for key in completed {
+        let Some(latest) = inner.latest.get(request).copied() else {
+            return;
+        };
+        let key = ReplayEntryKey {
+            request: request.clone(),
+            fingerprint: latest.fingerprint,
+            generation: latest.generation,
+        };
+        if matches!(inner.entries.get(&key), Some(ReplayState::Completed { .. })) {
             Self::remove_completed(inner, &key);
         }
     }
 
     fn remove_completed(inner: &mut CacheInner, key: &ReplayEntryKey) {
-        if let Some(ReplayState::Completed { encoded_reply, .. }) = inner.entries.remove(key) {
-            inner.completed_bytes = inner.completed_bytes.saturating_sub(encoded_reply.len());
+        if let Some(ReplayState::Completed { retained_bytes, .. }) = inner.entries.remove(key) {
+            inner.completed_bytes = inner.completed_bytes.saturating_sub(retained_bytes);
         }
         if Self::is_latest(inner, key) {
             inner.latest.remove(&key.request);
@@ -293,22 +324,28 @@ impl ReplayCache {
             .is_some_and(|latest| latest.generation == key.generation && latest.fingerprint == key.fingerprint)
     }
 
-    fn evict_oldest_completed(inner: &mut CacheInner) -> bool {
-        let oldest = inner
-            .entries
-            .iter()
-            .filter_map(|(key, state)| match state {
-                ReplayState::Completed { completed_at, .. } => Some((key.clone(), *completed_at)),
-                ReplayState::InFlight { .. } => None,
-            })
-            .min_by_key(|(_, completed_at)| *completed_at)
-            .map(|(key, _)| key);
-        if let Some(oldest) = oldest {
-            Self::remove_completed(inner, &oldest);
-            true
-        } else {
-            false
+    fn compact_completion_order(inner: &mut CacheInner) {
+        // Lazy deletion makes the hot path constant-time, but repeated reuse
+        // of a newer XID can leave tombstones behind an older live entry.
+        // Compact infrequently to keep that auxiliary memory bounded while
+        // preserving amortized O(1) updates.
+        let compact_at = inner.entries.len().saturating_mul(2).max(64);
+        if inner.completed_order.len() > compact_at {
+            let entries = &inner.entries;
+            inner
+                .completed_order
+                .retain(|key| matches!(entries.get(key), Some(ReplayState::Completed { .. })));
         }
+    }
+
+    fn evict_oldest_completed(inner: &mut CacheInner) -> bool {
+        while let Some(oldest) = inner.completed_order.pop_front() {
+            if matches!(inner.entries.get(&oldest), Some(ReplayState::Completed { .. })) {
+                Self::remove_completed(inner, &oldest);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -339,6 +376,34 @@ mod tests {
         lease.complete(Bytes::from_static(b"reply"));
         assert_eq!(waiter.await.unwrap().unwrap(), Bytes::from_static(b"reply"));
         assert!(matches!(cache.begin(key(1), fingerprint).await.unwrap(), ReplayDecision::Replay(_)));
+    }
+
+    #[tokio::test]
+    async fn segmented_replies_are_compacted_before_replay_retention() {
+        let cache = Arc::new(ReplayCache::new(2, 2048, Duration::from_secs(10)));
+        let fingerprint = RequestFingerprint([8; 32]);
+        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+            ReplayDecision::Execute(lease) => lease,
+            _ => panic!("expected execution lease"),
+        };
+        let waiter = match cache.begin(key(1), fingerprint).await.unwrap() {
+            ReplayDecision::Wait(waiter) => waiter,
+            _ => panic!("expected waiter"),
+        };
+        let mut oversized = Vec::with_capacity(1024 * 1024);
+        oversized.resize(1024, 0x5a);
+        let payload = Bytes::from(oversized);
+        let payload_pointer = payload.as_ptr();
+        lease.complete(EncodedReply::segmented(Bytes::from_static(b"prefix"), payload, 2));
+
+        let waited = waiter.await.unwrap().unwrap();
+        assert_eq!(waited.segments()[1].as_ptr(), payload_pointer);
+        let replayed = match cache.begin(key(1), fingerprint).await.unwrap() {
+            ReplayDecision::Replay(reply) => reply,
+            _ => panic!("expected completed replay"),
+        };
+        assert_ne!(replayed.segments()[1].as_ptr(), payload_pointer);
+        assert_eq!(cache.retained_bytes().await, 1032);
     }
 
     #[tokio::test]
@@ -461,6 +526,66 @@ mod tests {
         let inner = cache.inner();
         assert!(inner.latest.len() <= inner.entries.len());
         assert!(inner.entries.len() <= cache.capacity);
+    }
+
+    #[tokio::test]
+    async fn owned_backing_capacity_counts_toward_the_replay_byte_limit() {
+        let cache = Arc::new(ReplayCache::new(3, 64, Duration::from_secs(10)));
+        let existing_fingerprint = RequestFingerprint([8; 32]);
+        let existing = match cache.begin(key(2), existing_fingerprint).await.unwrap() {
+            ReplayDecision::Execute(lease) => lease,
+            _ => panic!("expected existing execution"),
+        };
+        existing.complete(Vec::from(&b"keep"[..]));
+
+        let fingerprint = RequestFingerprint([9; 32]);
+        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+            ReplayDecision::Execute(lease) => lease,
+            _ => panic!("expected execution lease"),
+        };
+        let mut allocation = Vec::with_capacity(1024 * 1024);
+        allocation.extend_from_slice(b"tiny");
+        lease.complete(EncodedReply::from(allocation));
+
+        assert_eq!(cache.retained_bytes().await, 4);
+        assert!(matches!(cache.begin(key(2), existing_fingerprint).await.unwrap(), ReplayDecision::Replay(_)));
+        assert!(matches!(cache.begin(key(1), fingerprint).await.unwrap(), ReplayDecision::Execute(_)));
+    }
+
+    #[tokio::test]
+    async fn stale_segmented_generation_is_not_retained() {
+        let cache = Arc::new(ReplayCache::new(3, 2048, Duration::from_secs(10)));
+        let stale_fingerprint = RequestFingerprint([10; 32]);
+        let stale = match cache.begin(key(1), stale_fingerprint).await.unwrap() {
+            ReplayDecision::Execute(lease) => lease,
+            _ => panic!("expected stale execution"),
+        };
+        let latest_fingerprint = RequestFingerprint([11; 32]);
+        let latest = match cache.begin(key(1), latest_fingerprint).await.unwrap() {
+            ReplayDecision::Execute(lease) => lease,
+            _ => panic!("expected latest execution"),
+        };
+
+        stale.complete(EncodedReply::segmented(Bytes::from_static(b"prefix"), Bytes::from(vec![0x5a; 1024]), 0));
+        assert_eq!(cache.retained_bytes().await, 0);
+        assert!(matches!(cache.begin(key(1), latest_fingerprint).await.unwrap(), ReplayDecision::Wait(_)));
+        drop(latest);
+    }
+
+    #[tokio::test]
+    async fn repeated_xid_reuse_keeps_completion_order_bounded() {
+        let cache = Arc::new(ReplayCache::new(4, 1024, Duration::from_secs(10)));
+        for generation in 0..1000u32 {
+            let fingerprint = RequestFingerprint([generation as u8; 32]);
+            let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+                ReplayDecision::Execute(lease) => lease,
+                _ => panic!("expected a new generation"),
+            };
+            lease.complete(Bytes::from_static(b"reply"));
+        }
+        let inner = cache.inner();
+        assert_eq!(inner.entries.len(), 1);
+        assert!(inner.completed_order.len() <= 64);
     }
 
     #[tokio::test]

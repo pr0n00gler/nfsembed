@@ -254,6 +254,25 @@ and automatically coordinated cross-host runners live under
 verifies mutation state, pagination, reconnect, restart, concurrency,
 read-only behavior, and case policy through real kernel clients.
 
+Performance benchmarks
+======================
+
+Criterion benchmarks cover large RPC opaque values, zero-copy WRITE decoding,
+segmented READ reply assembly and replay cloning, fragmented record I/O,
+READDIR response truncation, full replay-cache hits, and authenticated
+file-handle encoding and verification. Run them with:
+
+```sh
+cargo bench --bench performance
+```
+
+To compare a change against a saved local baseline:
+
+```sh
+cargo bench --bench performance -- --save-baseline before
+cargo bench --bench performance -- --baseline before
+```
+
 Relevant RFCs
 =============
  - XDR is the message format: RFC 1014. https://datatracker.ietf.org/doc/html/rfc1014

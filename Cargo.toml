@@ -11,7 +11,7 @@ keywords = ["nfs"]
 license = "BSD-3-Clause"
 categories = ["network-programming", "filesystem"]
 publish = true
-include = ["src/**/*", "src/*", "examples/**/*", "tests/**/*", "Cargo.toml", "LICENSE", "README.md"]
+include = ["src/**/*", "src/*", "examples/**/*", "tests/**/*", "benches/**/*", "Cargo.toml", "LICENSE", "README.md"]
 
 
 [lib]
@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = t
 intaglio = { version = "1.6", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [features]
@@ -57,3 +58,7 @@ path = "examples/mirrorfs.rs"
 [[example]]
 name = "certification_server"
 path = "examples/certification_server.rs"
+
+[[bench]]
+name = "performance"
+harness = false
