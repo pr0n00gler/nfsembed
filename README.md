@@ -1,84 +1,285 @@
-Rust NFSv3 Server
-=================
-This is an incomplete but very functional implementation of an NFSv3 server
-in Rust.
+Embedded Rust NFSv3 Server
+==========================
 
-Why? You may ask. 
+`nfsserve` is an embeddable NFSv3-over-TCP server driven by an
+application-provided virtual filesystem. The application owns the Tokio
+runtime, listener, process lifecycle, signal handling, and operating-system
+mount execution.
 
-I wanted to implement a user-mode file-system mount that is truly cross-platform.
-What is a protocol that pretty much every OS supports? NFS.
+The production target is native Linux and macOS NFSv3 clients using:
 
-Why not FUSE you may ask:
-1. FUSE is annoying to users on Mac and Windows (drivers necessary).
-2. It takes a lot of care to build a FUSE driver for remote filesystems. 
-NFS clients however have a lot of historical robustification for
-slow-responding, or perhaps, never-responding servers. 
-3. The OS is pretty good at caching NFS. There are established principles for 
-cache eviction, for metadata, or for data. With a FUSE driver I have to do
-a lot of the work myself.
-
-So, this is a FUSE-like user-mode filesystem API that basically works by 
-creating a localhost NFSv3 server you can mount.
-
-This is used in [hf-mount](https://github.com/huggingface/hf-mount) to provide the `hf-mount`
-functionality.
-
-Run the Demo
-============
-To run the demofs, this will host an NFS server on localhost:11111
-```
-cargo build --example demo --features demo
-./target/debug/examples/demo
+```text
+vers=3,tcp,port=<port>,mountport=<port>
 ```
 
-To mount. On Linux (sudo may be required):
-```
-mkdir demo
-mount.nfs -o user,noacl,nolock,vers=3,tcp,wsize=1048576,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ demo
-```
+> Note: this is a fork of https://github.com/huggingface/nfsserve project with more tests + a lot of improvements.
 
-On Mac:
-```
-mkdir demo
-mount_nfs -o nolocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ demo
-```
+What changed in the fork
+========================
 
-On Windows (Pro required as Home does not have NFS client):
-```
-mount.exe -o anon,nolock,mtype=soft,fileaccess=6,casesensitive,lang=ansi,rsize=128,wsize=128,timeout=60,retry=2 \\127.0.0.1\\ X:
-```
+The fork is a breaking, production-oriented refactor of the original `nfsserve` crate.
+It preserves the useful protocol definitions and interoperability knowledge,
+but replaces the public server lifecycle, VFS contract, wire codec, transport,
+retransmission handling, file handles, and test strategy. It is an evolution of
+the existing crate rather than a clean-room rewrite.
 
-Note that the demo filesystem is *writable*. 
+The high-level API changes are:
+
+| original | fork | Why it changed |
+| --- | --- | --- |
+| Implement `NFSFileSystem` | Implement `VirtualFileSystem` | The backend can now express identity, atomic mutations, write durability, directory cookies, and all NFSv3 procedures. |
+| Create an `NFSTcpListener` that owns its listener and runs forever | Give an application-owned `TcpListener` to `NfsServer::start` or `NfsServer::serve` | The embedding application owns the Tokio runtime, socket binding, shutdown signal, and process lifecycle; `serve` also lets it place the top-level future. |
+| Identify backend objects with a bare integer | Return an `ObjectKey { file_id, generation }` | Reused backend IDs can be distinguished and protected inside authenticated NFS handles. |
+| Return operation-specific values and let handlers fetch attributes separately | Return `MutationResult<T>` with atomic before/after WCC data | NFS weak-cache-consistency replies no longer race separate `getattr` calls. |
+| Treat duplicate XIDs as requests to drop | Wait for or replay the original encoded reply | Client retransmissions get at-most-once behavior while the bounded replay entry is retained. |
+| Keep the host-filesystem demo in the main API | Keep it behind the non-default `demo` feature | The production contract is platform-neutral and does not define policy through a sample host backend. |
+
+Embedded lifecycle
+------------------
+
+`NfsServer`, `NfsServerBuilder`, `ServerHandle`, and `MountInfo` replace the old
+run-forever listener API. The refactored lifecycle provides:
+
+* `start(listener)` for a managed server task and `serve(listener, signal)` for
+  callers that want to own the server future;
+* idempotent shutdown and waitable termination;
+* a configurable graceful-shutdown deadline;
+* cancellation and joining of connection and request tasks;
+* the actual bound address and ports, including listeners bound to port zero;
+* typed startup and fatal server errors without `process::exit`;
+* multiple independent server instances and multiple exports in one process;
+* no global Tokio runtime, signal handler, logger, metrics exporter, file-handle
+  generation, or replay state.
+
+The library still does not mount filesystems, elevate privileges, install
+signals, or manage a daemon. Those remain responsibilities of the embedding
+application.
+
+Virtual filesystem contract
+---------------------------
+
+The new `VirtualFileSystem` trait is a complete NFSv3 backend boundary:
+
+* Every permission-sensitive operation receives a `RequestContext` containing
+  the authenticated `Principal`, client address, and `ExportId`.
+* AUTH_SYS exposes UID, primary GID, supplementary groups, and the machine name;
+  anonymous access remains an explicit policy choice.
+* `ObjectKey` separates backend identity from the opaque NFS file handle.
+* `MutationResult<T>` carries atomic before/after weak-cache-consistency data.
+* `CreateMode` represents unchecked, guarded, and exclusive creation, including
+  the exclusive verifier.
+* `WriteStability`, `WriteResult`, and `commit` represent unstable, data-sync,
+  and file-sync durability without claiming stronger persistence than the
+  backend achieved.
+* Directory enumeration uses opaque cookies and verifiers. The backend returns
+  a page, while the protocol layer performs exact XDR-size truncation.
+* `fsstat`, `fsinfo`, and `pathconf` values come from the backend. `FSINFO`
+  transfer sizes are clamped to configured transport limits, and the reported
+  `PATHCONF` name limit is capped at the server's validated 255-byte maximum.
+* Default mutation methods use the declared read-only capability to return
+  `NFS3ERR_ROFS`; otherwise they return `NFS3ERR_NOTSUPP`. Backends that
+  override those methods remain responsible for enforcing their own read-only
+  and authorization policies.
+* Request futures are cancelled at the configured deadline. Backend mutations
+  must therefore be cancellation-safe and must not detach untracked work.
+
+The trait covers `GETATTR`, `SETATTR`, `LOOKUP`, `ACCESS`, `READLINK`, `READ`,
+`WRITE`, `CREATE`, `MKDIR`, `SYMLINK`, `MKNOD`, `REMOVE`, `RMDIR`, `RENAME`,
+`LINK`, `READDIR`, `READDIRPLUS`, `FSSTAT`, `FSINFO`, `PATHCONF`, and `COMMIT`.
+
+Typed and bounded protocol implementation
+-----------------------------------------
+
+The manual response-building paths were replaced with typed NFSv3
+argument/result unions and typed MOUNTv3 results. MOUNT arguments are small and
+decoded directly in their procedure handlers. A handler constructs one complete
+result before encoding it, including every legal success and failure arm. This
+removes the malformed partial-response paths that existed around WCC data,
+attributes, MOUNT replies, and several error branches.
+
+The new RPC/XDR layer:
+
+* bounds records, fragments, fragment counts, opaque fields, strings, arrays,
+  AUTH_SYS groups, file handles, names, symlink targets, and transfer sizes;
+* reserves aggregate memory before allocating record or reply bodies;
+* uses checked arithmetic and rejects trailing or truncated arguments;
+* rejects non-canonical booleans and invalid enum/union discriminants;
+* returns decoding errors instead of allocating from unchecked wire lengths or
+  panicking on network-controlled input;
+* correctly emits RPC version/program/procedure mismatch ranges, authentication
+  failures, garbage-argument replies, and `SYSTEM_ERR`.
+
+All 22 NFSv3 procedures and all six MOUNTv3 procedures are implemented. MOUNT
+uses a bounded per-run mount table and component-aware export matching.
+Minimal portmapper `GETPORT` support is optional and disabled by default; it
+returns zero for unsupported program/version/transport combinations and never
+registers with the operating-system portmapper.
+
+Resource hardening and request deadlines
+----------------------------------------
+
+`ServerLimits` makes resource policy explicit. It bounds connections,
+per-connection queued requests, global in-flight executions, RPC record and
+fragment sizes, aggregate request and reply buffers, replay entries and bytes,
+mount-table entries, transfer sizes, and directory responses.
+
+The connection path now uses bounded channels and semaphores rather than
+unrestricted spawning. One absolute request deadline covers queueing, reply
+budget acquisition, replay waiting, execution capacity, and the VFS future.
+Idle reads use `idle_connection_timeout`; queue and socket-write progress use
+`request_timeout`. Slow readers are disconnected, completed connection tasks
+are reaped, and buffer permits remain owned by detached tracked executions until
+their request/reply memory is gone. No server lock is held while awaiting
+application VFS code.
+
+Replay and file-handle safety
+-----------------------------
+
+The old seen-XID tracker was replaced by a per-run reply cache. Its request
+fingerprint includes program, version, procedure, principal identity, and a
+digest of the arguments. Exact in-flight duplicates wait; exact completed
+duplicates receive the cached bytes; a changed fingerprint is treated as XID
+reuse. Concurrent XID generations, cancellation, lost socket replies, capacity,
+TTL, and retained reply bytes are all handled explicitly.
+
+NFS file handles now contain a format version, server-instance identity, export
+identity, backend file ID, backend generation, and keyed integrity tag while
+remaining within the 64-byte NFSv3 limit. Forged handles, cross-export handles,
+and handles from a previous server run are rejected before reaching the VFS.
+The server-instance write verifier also changes for every `start` or `serve`
+run.
+
+Observability and certification
+-------------------------------
+
+The production path emits `tracing` request spans and completion events with
+procedure, XID, client, duration, protocol status, byte counts, and active
+connection/request counts. Additional events cover replay decisions,
+connection-limit rejection, execution timeouts and cancellations, and task
+failures. The crate never installs a subscriber and avoids logging file data,
+raw authentication buffers, complete packets, or pathnames at normal levels.
+
+The test suite was expanded from basic behavior checks into release gates:
+
+* public-API TCP tests cover every NFSv3 and MOUNTv3 procedure, every result
+  union, AUTH_SYS, WCC, durability, pagination, replay, handles, lifecycle,
+  limits, observability, and multiple exports;
+* adversarial suites sweep fragmentation, truncated inputs, field limits,
+  invalid discriminants, forged handles, directory response sizes, slow
+  readers, connection churn, and bounded-memory/concurrency behavior;
+* seven cargo-fuzz targets exercise RPC/XDR, authentication, record marking,
+  handles, WRITE, READDIR/READDIRPLUS, and replay transitions;
+* Linux and macOS kernel clients run read-write, restart, lost-reply, read-only,
+  and case-policy profiles in same-host CI; cross-host macOS/Linux helper scripts
+  are also available for local certification;
+* CI checks formatting, strict Clippy, tests with default and all features,
+  rustdoc warnings, crate packaging, fuzz smoke sessions, and native
+  interoperability.
+
+Migration checklist
+-------------------
+
+Applications moving from the original `nfsserve` version should:
+
+1. Replace `NFSFileSystem` with `VirtualFileSystem` and use `ObjectKey` rather
+   than exposing raw numeric IDs as NFS handles.
+2. Update mutations to return `MutationResult<T>` atomically and implement the
+   requested create, write-stability, `COMMIT`, cookie/verifier, and filesystem
+   information semantics that the backend supports.
+3. Make authorization decisions from `RequestContext` and select an explicit
+   `AuthPolicy`.
+4. Construct `NfsServer` with the desired exports and `ServerLimits`, bind a
+   Tokio `TcpListener` in the application, then call `start` or `serve`.
+5. Use `MountInfo` to construct the platform mount command; do not expect the
+   library to mount, elevate privileges, or manage signals.
+6. Make backend futures cancellation-safe because the server drops them when
+   the request deadline expires.
+7. Keep using the old demo API only temporarily with `--features demo`; there
+   is no automatic adapter from `NFSFileSystem` to the production VFS contract.
 
 Usage
 =====
 
-You simply need to implement the vfs::NFSFileSystem
-trait. See demofs.rs for an example and bin/main.rs for how to actually start
-a service. The interface generally not difficult to implement; demanding mainly
-the ability to associate every file system object (directory/file) with a 64-bit
-ID. Directory listing can be a bit complicated due to the pagination requirements.
+Implement `vfs::VirtualFileSystem`, then construct a server without creating a
+runtime or binding a socket inside the library:
 
-TODO and Seeking Contributors
-=============================
- - Improve documentation
- - More things in Mount Protocol and NFS Protocol has to be implemented.
- There are a bunch of messages that reply as "Unavailable". For instance, 
- we implement `READDIR_PLUS` but not `READDIR` which is usually fine, except
- that Windows insists on always trying READDIR first. 
- Link creation is also not supported.
- - The RPC message handling in `nfs_handlers.rs` leaves a lot to be desired.
- The response serialization is very manual. Some cleanup will be good.
- - Windows mount "kinda" works (only on Windows 11 Pro with the NFS server),
- but prints a lot of garbage due to various unimplemented APIs. Windows 11
- somehow tries to poll with very old NFS protocols constantly.
- - Many many perf optimizations. 
- - Maybe pull in the mount command from [xet-core](https://github.com/huggingface/xet-core/blob/main/rust/gitxetcore/src/xetmnt/mod.rs)
- so the user does not need to remember the `-o` incantations above.
- - Maybe make an SMB3 implementation so we can work on Windows Home edition
- - NFSv4 has some write performance optimizations that would be quite nice.
- The protocol is a bit more involving to implement though as it is somewhat
- stateful.
+```rust,ignore
+use nfsserve::{AuthPolicy, NfsServer, ServerLimits};
+use tokio::net::TcpListener;
+
+let server = NfsServer::builder(vfs)
+    .export_name("virtual-fs")
+    .limits(ServerLimits::production_defaults())
+    .auth_policy(AuthPolicy::AuthSys)
+    .build()?;
+
+let listener = TcpListener::bind("127.0.0.1:0").await?;
+let handle = server.start(listener).await?;
+let mount_info = handle.mount_info();
+
+// The embedding application performs the OS mount.
+
+handle.shutdown().await?;
+handle.wait().await?;
+```
+
+Applications that want ownership of the top-level server future can use
+`server.serve(listener, shutdown_signal).await` instead.
+
+The VFS receives a `RequestContext` containing the authenticated principal,
+client address, and export ID. Object keys are wrapped in server-instance and
+export-scoped authenticated file handles; backends never parse raw NFS handles.
+Additional independent exports can be added with
+`NfsServerBuilder::add_export`; `ServerHandle::mount_infos` reports the bound
+mount data for every configured export.
+
+Scope
+=====
+
+The crate implements NFSv3 and MOUNTv3 over TCP. Optional minimal portmapper
+support is disabled by default. NFSv4, UDP, NLM, ACL side protocols,
+RPCSEC_GSS, mount execution, privilege elevation, and process lifecycle are
+outside its scope. Backend operations that are unavailable return the NFS-level
+`NFS3ERR_NOTSUPP` result.
+
+End-to-end tests
+================
+
+The repository includes a public-API TCP certification harness covering every
+NFSv3 procedure, MOUNTv3, replay, authentication, limits, lifecycle,
+adversarial inputs, observability, strict documentation and package builds, and
+cargo-fuzz smoke sessions. Run the non-privileged repository gate with:
+
+```sh
+./tests/run_ci.sh
+```
+
+See [`tests/README.md`](tests/README.md) for the coverage matrix and the
+network-disabled Linux container command. Privileged Linux/macOS native-client
+runners and local cross-host helper scripts live under
+[`tests/native`](tests/native). Their persistent certification filesystem
+verifies mutation state, pagination, reconnect, restart, concurrency, read-only
+behavior, and case policy through real kernel clients. Same-host native tests
+run in their own CI workflow because mounting requires platform privileges.
+
+Performance benchmarks
+======================
+
+Criterion benchmarks cover large RPC opaque values, zero-copy WRITE decoding,
+segmented READ reply assembly and replay cloning, fragmented record I/O,
+READDIR response truncation, full replay-cache hits, and authenticated
+file-handle encoding and verification. Run them with:
+
+```sh
+cargo bench --bench performance
+```
+
+To compare a change against a saved local baseline:
+
+```sh
+cargo bench --bench performance -- --save-baseline before
+cargo bench --bench performance -- --baseline before
+```
 
 Relevant RFCs
 =============
@@ -90,105 +291,86 @@ Relevant RFCs
 
 Basic Source Layout
 ===================
- - context.rs: A connection context object that is passed around containing
- connection information, VFS information, etc.
- - xdr.rs: Serialization / Deserialization routines for XDR structures
- - tcp.rs: Main TCP handling entry point
- - rpcwire.rs: Reads and write RPC messages from a TCP socket and performs outer 
-               most RPC message decoding, redirecting to NFS/Mount/Portmapper 
-               implementations as needed.
- - rpc.rs: The structure of a RPC call and reply. All XDR encoded.
- - portmap.rs/portmap\_handlers.rs: The XDR structures required by the Portmapper protocol and the Portmapper RPC handlers.
- - mount.rs/mount\_handlers.rs: The XDR structures required by the Mount protocol and the Mount RPC handlers.
- - nfs.rs/nfs\_handlers.rs: The XDR structures required by the NFS protocol and the NFS RPC handlers.
+
+ - `src/server/`: builder, transport-aware limits, lifecycle handle, deadline-bound VFS execution, and byte-budgeted connection tasks.
+ - `src/rpc/`: bounded XDR primitives, authentication, and TCP record marking.
+ - `src/nfs3/`: NFSv3 types, procedure identities, and codec surface.
+ - `src/mount3/`: MOUNTv3 types and export matching.
+ - `src/portmap/`: optional minimal portmapper support.
+ - `src/vfs/`: request context, object and mutation types, and the VFS contract.
+ - `src/replay/`: count-, byte-, TTL-, and XID-generation-bounded duplicate-request reply cache.
+ - `src/handles/`: authenticated, instance-scoped file-handle encoding.
+
+The pre-1.0 implementation remains available only to the `demo` feature for
+temporary migration compatibility.
 
 
-More More Details Than Necessary
-================================
-The basic way a message works is:
-1. We read a collection of fragments off a TCP stream 
-(a 4 byte length header followed by a bunch of bytes)
-2. We assemble the fragments into a record
-3. The Record is of a SUN RPC message type.
-4. A message tells us 3 pieces of information,
-     - The RPC Program (just an integer denoting
-      a protocol "class". For instance NFS protocol is 100003, the Portmapper protocol is 100000).
-     - The version of the RPC program (ex: 3 = NFSv3, 4 = NFSv4, etc)
-     - The method invoked (Which NFS method to call) (See for instance nfs.rs top comment for the list)
-5. Continuing to decode the message will give us the arguments of the method
-6. And we take the method response, wrap it around a record and return it. 
+Protocol flow
+=============
+
+An RPC call over TCP follows this path:
+
+1. The record-marking layer reads one or more fragments. Each fragment starts
+   with a four-byte header containing the final-fragment bit and fragment size.
+2. The bounded fragments are assembled into one SUN RPC record.
+3. The RPC header selects a program, version, and procedure. This crate serves
+   NFS (`100003`), MOUNT (`100005`), and, when enabled, portmapper (`100000`) on
+   the same TCP listener.
+4. The selected handler decodes and validates the procedure arguments, invokes
+   the VFS when needed, and builds a complete protocol result.
+5. The result is wrapped in an RPC reply and emitted as one or more bounded TCP
+   record fragments.
 
 Portmapper
 ----------
-First, lets get portmapper out of the way. This is a *very* old mechanism which
-is rarely used anymore. The portmapper is a daemon which runs on a machine running
-on port 111. When NFS, or other RPC services start, they register with the 
-portmapper service with the port they are listening on (Say NFS on 2049). 
-Then when another machine wants to connect to NFS, they first ask the port mapper
-on 111 to ask about which port NFS is listening on, then connects to the returned 
-port.
 
-We do not strictly need to implement this protocol as this is pretty much
-unused these days (NFSv4 does not use the portmapper for instance). If `-o port` and `-o mountport`
-are specified, Linux and Mac's builtin NFS client do not need it either.
-But this was useful for debugging and testing as libnfs seems to require a
-portmapper, but it annoyingly hardcodes it to 111. I modified the source to
-change it to 12000 for testing and implemented the one `PMAPPROC_GETPORT`
-method so I can test with libnfs.
+Traditional ONC RPC services can register with an operating-system portmapper
+on TCP/UDP port 111 so clients can discover their ports. This crate does not
+register with that daemon or bind port 111 on the application's behalf.
+
+When `PortmapperMode::Enabled` is selected, the embedded server accepts
+portmapper `NULL` and `GETPORT` calls on the same application-provided TCP
+listener. `GETPORT` reports that listener's port for supported NFSv3 or MOUNTv3
+TCP queries and zero for unsupported combinations. It is disabled by default;
+Linux and macOS clients can instead use explicit `port` and `mountport` mount
+options.
 
 
 NFS Basics
 ==========
-The way NFS works is that every file system object (dir/file/symlink) has 2
-ways in which it can be addressed:
+NFSv3 exposes two relevant object identifiers:
 
-1. `fileid3: u64` . A 64-bit integer. Equivalent to an inode number.
-2. `nfs_fh3`: A variable opaque object up to 64 bytes long.
+1. `fileid3`, a 64-bit filesystem-defined ID reported in attributes and
+   directory entries.
+2. `nfs_fh3`, a variable opaque file handle of up to 64 bytes that clients send
+   back in later operations.
 
-Basically anytime the client tries to access any information about an object,
-it needs an `nfs_fh3`. The purpose of the `nfs_fh3` serves 2 purposes:
+Most object operations address their target with an `nfs_fh3`. In this server,
+the handle authenticates and encodes the server-run identity, export ID, and
+backend `ObjectKey`; clients do not inspect those fields. A handle from an older
+`start` or `serve` run is rejected as stale, while a malformed or cross-export
+handle is rejected as invalid before the VFS is called.
 
- - Allow server to cache additional query information in the handle that may exceed
- 64-bit. For instance if the server has multiple exports on different disk volumes,
- I may need a few more bits to identify the disk volume.
- - Allow client to identify when server has "restarted" and thus client has to
- clear all caches. the `nfs_fh3` handle should contain a token that is unique
- to when the NFS server first started up which allows the server to check that
- the handle is still valid. If the server has restarted, all previous handles
- will therefore be "expired" and any usage of them should trigger a handle expiry
- error informing the clients to expunge all caches.
-
-
-However, the only way to obtain an `nfs_fh3` for a file is via directory traversal.
-i.e. There is a lookup method 
-`LOOKUP(directory's handle, filename of file/dir in directory)` 
-which returns the handle for the filename.
-
-For instance to get the handle of a file "dir/a.txt", I first need the handle
-for the directory "dir/", then query `LOOKUP(handle, "a.txt")`.
-
-The question is then, how do I get my first handle? That is what the MOUNT
-protocol addresses.
+The first handle normally comes from MOUNT. Later handles can come from
+`LOOKUP`, successful object-creation procedures, or `READDIRPLUS`. For example,
+after obtaining the exported root handle, a client can resolve `dir/a.txt` with
+successive `LOOKUP` calls.
 
 Mount
 -----
-The MOUNT protocol provides a list of "exports", (in the simplest case. Just "/")
-and the client will request to MNT("/") which will return the handle of this 
-root directory.
+The MOUNT protocol lists exports and turns a mounted export path into its first
+NFS file handle. For a server exporting `/`, `MNT("/")` returns the root handle.
+Component-aware matching also permits a path below an export; the server walks
+the remaining components through VFS `lookup` calls.
 
-Normally the server can and do maintain a list of mounts which can be queried,
-and really the client can UMNT (unmount) as well.  But in our case we
-only implement MNT and EXPORT which suffices. NFS clients generally
-ignore the return message of UMNT as there is really nothing the
-client can do on a UMNT failure. As such our Mount protocol implementation
-is entirely stateless.
+The server maintains a bounded mount table per server run and implements `MNT`,
+`DUMP`, `UMNT`, `UMNTALL`, and `EXPORT`. Unmount procedures return the void
+MOUNTv3 result required by the protocol.
 
 NFS
 ---
-The NFS protocol itself is pretty straightforward with most annoyances
-due to handling of the XDR messaging format (in paticular with optional,
-lists, etc).
-
-What is nice is that the design of NFS is completely stateless. It is mostly
-sit down and implement all the methods that are hit and test them against a 
-client.
+NFSv3 operations are request-oriented and do not establish a server-side open
+file session. The overall implementation is not completely stateless, however:
+the application VFS owns filesystem state, and each server run keeps bounded
+mount and replay tables. The replay cache is required to give retransmitted
+mutations at-most-once behavior while their entries remain retained.

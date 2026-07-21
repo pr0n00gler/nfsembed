@@ -1,359 +1,472 @@
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserve::nfs::{self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
-use nfsserve::tcp::*;
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{
+    CreateMode, CreatedObject, DirectoryEntry, FileAttributes, FileType, FsInfo, FsStat, MutationResult, NfsError,
+    NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
+    VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
+};
+use nfsserve::{AuthPolicy, NfsServer};
+use tokio::net::TcpListener;
+
+const ROOT_ID: u64 = 1;
+const GENERATION: u64 = 1;
+const READDIR_VERIFIER: [u8; 8] = *b"DEMODIR1";
 
 #[derive(Debug, Clone)]
-enum FSContents {
+enum Contents {
     File(Vec<u8>),
-    Directory(Vec<fileid3>),
-}
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct FSEntry {
-    id: fileid3,
-    attr: fattr3,
-    name: filename3,
-    parent: fileid3,
-    contents: FSContents,
+    Directory(Vec<u64>),
 }
 
-fn make_file(name: &str, id: fileid3, parent: fileid3, contents: &[u8]) -> FSEntry {
-    let attr = fattr3 {
-        ftype: ftype3::NF3REG,
-        mode: 0o755,
-        nlink: 1,
-        uid: 507,
-        gid: 507,
-        size: contents.len() as u64,
-        used: contents.len() as u64,
-        rdev: specdata3::default(),
-        fsid: 0,
-        fileid: id,
-        atime: nfstime3::default(),
-        mtime: nfstime3::default(),
-        ctime: nfstime3::default(),
-    };
-    FSEntry {
-        id,
-        attr,
-        name: name.as_bytes().into(),
-        parent,
-        contents: FSContents::File(contents.to_vec()),
+#[derive(Debug, Clone)]
+struct Entry {
+    id: u64,
+    attributes: FileAttributes,
+    name: Vec<u8>,
+    parent: u64,
+    contents: Contents,
+    exclusive_verifier: Option<[u8; 8]>,
+}
+
+fn now() -> NfsTime {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    NfsTime {
+        seconds: duration.as_secs(),
+        nanoseconds: duration.subsec_nanos(),
     }
 }
 
-fn make_dir(name: &str, id: fileid3, parent: fileid3, contents: Vec<fileid3>) -> FSEntry {
-    let attr = fattr3 {
-        ftype: ftype3::NF3DIR,
-        mode: 0o777,
-        nlink: 1,
-        uid: 507,
-        gid: 507,
-        size: 0,
-        used: 0,
-        rdev: specdata3::default(),
-        fsid: 0,
-        fileid: id,
-        atime: nfstime3::default(),
-        mtime: nfstime3::default(),
-        ctime: nfstime3::default(),
-    };
-    FSEntry {
+fn make_file(name: &[u8], id: u64, parent: u64, contents: &[u8]) -> Entry {
+    let time = now();
+    Entry {
         id,
-        attr,
-        name: name.as_bytes().into(),
+        attributes: FileAttributes {
+            file_type: FileType::Regular,
+            mode: 0o755,
+            links: 1,
+            uid: 507,
+            gid: 507,
+            size: contents.len() as u64,
+            used: contents.len() as u64,
+            device: None,
+            fs_id: 0,
+            file_id: id,
+            access_time: time,
+            modify_time: time,
+            change_time: time,
+        },
+        name: name.to_vec(),
         parent,
-        contents: FSContents::Directory(contents),
+        contents: Contents::File(contents.to_vec()),
+        exclusive_verifier: None,
+    }
+}
+
+fn make_directory(name: &[u8], id: u64, parent: u64, children: Vec<u64>) -> Entry {
+    let time = now();
+    Entry {
+        id,
+        attributes: FileAttributes {
+            file_type: FileType::Directory,
+            mode: 0o777,
+            links: 2,
+            uid: 507,
+            gid: 507,
+            size: 0,
+            used: 0,
+            device: None,
+            fs_id: 0,
+            file_id: id,
+            access_time: time,
+            modify_time: time,
+            change_time: time,
+        },
+        name: name.to_vec(),
+        parent,
+        contents: Contents::Directory(children),
+        exclusive_verifier: None,
     }
 }
 
 #[derive(Debug)]
-pub struct DemoFS {
-    fs: Mutex<Vec<FSEntry>>,
-    rootdir: fileid3,
+pub struct DemoFs {
+    entries: Mutex<Vec<Entry>>,
 }
 
-impl Default for DemoFS {
-    fn default() -> DemoFS {
-        // build the following directory structure
+impl Default for DemoFs {
+    fn default() -> Self {
         // /
-        // |-a.txt
-        // |-b.txt
-        // |-another_dir
-        //      |-thisworks.txt
-        //
+        // |- a.txt
+        // |- b.txt
+        // `- another_dir
+        //    `- thisworks.txt
         let entries = vec![
-            make_file("", 0, 0, &[]), // fileid 0 is special
-            make_dir(
-                "/",
-                1,             // current id. Must match position in entries
-                1,             // parent id
-                vec![2, 3, 4], // children
-            ),
-            make_file(
-                "a.txt",
-                2, // current id
-                1, // parent id
-                "hello world\n".as_bytes(),
-            ),
-            make_file("b.txt", 3, 1, "Greetings to xet data\n".as_bytes()),
-            make_dir("another_dir", 4, 1, vec![5]),
-            make_file("thisworks.txt", 5, 4, "i hope\n".as_bytes()),
+            make_file(b"", 0, 0, &[]), // Object id zero remains unused.
+            make_directory(b"/", ROOT_ID, ROOT_ID, vec![2, 3, 4]),
+            make_file(b"a.txt", 2, ROOT_ID, b"hello world\n"),
+            make_file(b"b.txt", 3, ROOT_ID, b"Greetings to xet data\n"),
+            make_directory(b"another_dir", 4, ROOT_ID, vec![5]),
+            make_file(b"thisworks.txt", 5, 4, b"i hope\n"),
         ];
-
-        DemoFS {
-            fs: Mutex::new(entries),
-            rootdir: 1,
+        Self {
+            entries: Mutex::new(entries),
         }
     }
 }
 
-// For this demo file system we let the handle just be the file
-// there is only 1 file. a.txt.
+impl DemoFs {
+    fn key(id: u64) -> ObjectKey {
+        ObjectKey {
+            file_id: id,
+            generation: GENERATION,
+        }
+    }
+
+    fn id(object: ObjectKey) -> Result<u64, NfsError> {
+        if object.generation == GENERATION {
+            Ok(object.file_id)
+        } else {
+            Err(NfsError::Stale)
+        }
+    }
+
+    fn wcc(attributes: &FileAttributes) -> WccAttributes {
+        WccAttributes {
+            size: attributes.size,
+            modify_time: attributes.modify_time,
+            change_time: attributes.change_time,
+        }
+    }
+
+    fn created(entry: &Entry) -> CreatedObject {
+        CreatedObject {
+            object: Self::key(entry.id),
+            attributes: Some(entry.attributes.clone()),
+        }
+    }
+
+    fn apply_attributes(entry: &mut Entry, attributes: SetAttributes) -> Result<(), NfsError> {
+        if let Some(mode) = attributes.mode {
+            entry.attributes.mode = mode;
+        }
+        if let Some(uid) = attributes.uid {
+            entry.attributes.uid = uid;
+        }
+        if let Some(gid) = attributes.gid {
+            entry.attributes.gid = gid;
+        }
+        if let Some(size) = attributes.size {
+            let Contents::File(bytes) = &mut entry.contents else {
+                return Err(NfsError::Invalid);
+            };
+            bytes.resize(usize::try_from(size).map_err(|_| NfsError::FileTooLarge)?, 0);
+            entry.attributes.size = size;
+            entry.attributes.used = size;
+        }
+        entry.attributes.access_time = match attributes.access_time {
+            Some(SetTime::ServerTime) => now(),
+            Some(SetTime::ClientTime(time)) => time,
+            None => entry.attributes.access_time,
+        };
+        entry.attributes.modify_time = match attributes.modify_time {
+            Some(SetTime::ServerTime) => now(),
+            Some(SetTime::ClientTime(time)) => time,
+            None => entry.attributes.modify_time,
+        };
+        entry.attributes.change_time = now();
+        Ok(())
+    }
+}
+
 #[async_trait]
-impl NFSFileSystem for DemoFS {
-    fn root_dir(&self) -> fileid3 {
-        self.rootdir
-    }
-
-    fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
-    }
-
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        {
-            let mut fs = self.fs.lock().unwrap();
-            let mut fssize = fs[id as usize].attr.size;
-            if let FSContents::File(bytes) = &mut fs[id as usize].contents {
-                let offset = offset as usize;
-                if offset + data.len() > bytes.len() {
-                    bytes.resize(offset + data.len(), 0);
-                    bytes[offset..].copy_from_slice(data);
-                    fssize = bytes.len() as u64;
-                }
-            }
-            fs[id as usize].attr.size = fssize;
-            fs[id as usize].attr.used = fssize;
+impl VirtualFileSystem for DemoFs {
+    fn capabilities(&self) -> VfsCapabilities {
+        VfsCapabilities {
+            hard_links: false,
+            symbolic_links: false,
+            mknod: false,
+            ..VfsCapabilities::READ_WRITE
         }
-        self.getattr(id).await
     }
 
-    async fn create(&self, dirid: fileid3, filename: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
-        let newid: fileid3;
-        {
-            let mut fs = self.fs.lock().unwrap();
-            newid = fs.len() as fileid3;
-            fs.push(make_file(std::str::from_utf8(filename).unwrap(), newid, dirid, "".as_bytes()));
-            if let FSContents::Directory(dir) = &mut fs[dirid as usize].contents {
-                dir.push(newid);
-            }
-        }
-        Ok((newid, self.getattr(newid).await.unwrap()))
+    fn root(&self) -> ObjectKey {
+        Self::key(ROOT_ID)
     }
 
-    async fn create_exclusive(&self, _dirid: fileid3, _filename: &filename3) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    async fn getattr(&self, _context: &RequestContext, object: ObjectKey) -> Result<FileAttributes, NfsError> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .get(Self::id(object)? as usize)
+            .map(|entry| entry.attributes.clone())
+            .ok_or(NfsError::Stale)
     }
 
-    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let fs = self.fs.lock().unwrap();
-        let entry = fs.get(dirid as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        if let FSContents::File(_) = entry.contents {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
-        } else if let FSContents::Directory(dir) = &entry.contents {
-            // if looking for dir/. its the current directory
-            if filename[..] == [b'.'] {
-                return Ok(dirid);
-            }
-            // if looking for dir/.. its the parent directory
-            if filename[..] == [b'.', b'.'] {
-                return Ok(entry.parent);
-            }
-            for i in dir {
-                if let Some(f) = fs.get(*i as usize) {
-                    if f.name[..] == filename[..] {
-                        return Ok(*i);
-                    }
-                }
-            }
-        }
-        Err(nfsstat3::NFS3ERR_NOENT)
-    }
-    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs = self.fs.lock().unwrap();
-        let entry = fs.get(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        Ok(entry.attr)
-    }
-    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        let mut fs = self.fs.lock().unwrap();
-        let entry = fs.get_mut(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        match setattr.atime {
-            nfs::set_atime::DONT_CHANGE => {},
-            nfs::set_atime::SET_TO_CLIENT_TIME(c) => {
-                entry.attr.atime = c;
-            },
-            nfs::set_atime::SET_TO_SERVER_TIME => {
-                let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-                entry.attr.atime.seconds = d.as_secs() as u32;
-                entry.attr.atime.nseconds = d.subsec_nanos();
-            },
+    async fn lookup(
+        &self,
+        _context: &RequestContext,
+        parent: ObjectKey,
+        name: &NfsName,
+    ) -> Result<CreatedObject, NfsError> {
+        let parent = Self::id(parent)?;
+        let entries = self.entries.lock().unwrap();
+        let directory = entries.get(parent as usize).ok_or(NfsError::Stale)?;
+        let Contents::Directory(children) = &directory.contents else {
+            return Err(NfsError::NotDirectory);
         };
-        match setattr.mtime {
-            nfs::set_mtime::DONT_CHANGE => {},
-            nfs::set_mtime::SET_TO_CLIENT_TIME(c) => {
-                entry.attr.mtime = c;
-            },
-            nfs::set_mtime::SET_TO_SERVER_TIME => {
-                let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-                entry.attr.mtime.seconds = d.as_secs() as u32;
-                entry.attr.mtime.nseconds = d.subsec_nanos();
-            },
-        };
-        match setattr.uid {
-            nfs::set_uid3::uid(u) => {
-                entry.attr.uid = u;
-            },
-            nfs::set_uid3::Void => {},
+        if name.as_bytes() == b"." {
+            return Ok(Self::created(directory));
         }
-        match setattr.gid {
-            nfs::set_gid3::gid(u) => {
-                entry.attr.gid = u;
-            },
-            nfs::set_gid3::Void => {},
+        if name.as_bytes() == b".." {
+            return entries.get(directory.parent as usize).map(Self::created).ok_or(NfsError::Stale);
         }
-        match setattr.size {
-            nfs::set_size3::size(s) => {
-                entry.attr.size = s;
-                entry.attr.used = s;
-                if let FSContents::File(bytes) = &mut entry.contents {
-                    bytes.resize(s as usize, 0);
-                }
-            },
-            nfs::set_size3::Void => {},
-        }
-        Ok(entry.attr)
+        children
+            .iter()
+            .filter_map(|id| entries.get(*id as usize))
+            .find(|entry| entry.name == name.as_bytes())
+            .map(Self::created)
+            .ok_or(NfsError::NotFound)
     }
 
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let fs = self.fs.lock().unwrap();
-        let entry = fs.get(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        if let FSContents::Directory(_) = entry.contents {
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        } else if let FSContents::File(bytes) = &entry.contents {
-            let mut start = offset as usize;
-            let mut end = offset as usize + count as usize;
-            let eof = end >= bytes.len();
-            if start >= bytes.len() {
-                start = bytes.len();
-            }
-            if end > bytes.len() {
-                end = bytes.len();
-            }
-            return Ok((bytes[start..end].to_vec(), eof));
+    async fn access(&self, _context: &RequestContext, _object: ObjectKey, requested: u32) -> Result<u32, NfsError> {
+        Ok(requested)
+    }
+
+    async fn setattr(
+        &self,
+        _context: &RequestContext,
+        object: ObjectKey,
+        attributes: SetAttributes,
+        guard: Option<NfsTime>,
+    ) -> Result<MutationResult<()>, NfsError> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(Self::id(object)? as usize).ok_or(NfsError::Stale)?;
+        if guard.is_some_and(|guard| guard != entry.attributes.change_time) {
+            return Err(NfsError::NotSynchronized);
         }
-        Err(nfsstat3::NFS3ERR_NOENT)
+        let before = Some(Self::wcc(&entry.attributes));
+        Self::apply_attributes(entry, attributes)?;
+        Ok(MutationResult {
+            value: (),
+            before,
+            after: Some(entry.attributes.clone()),
+        })
+    }
+
+    async fn read(
+        &self,
+        _context: &RequestContext,
+        object: ObjectKey,
+        offset: u64,
+        count: u32,
+    ) -> Result<ReadResult, NfsError> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(Self::id(object)? as usize).ok_or(NfsError::Stale)?;
+        let Contents::File(bytes) = &entry.contents else {
+            return Err(NfsError::IsDirectory);
+        };
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+        let end = start.saturating_add(count as usize).min(bytes.len());
+        Ok(ReadResult {
+            data: bytes[start..end].to_vec(),
+            eof: end == bytes.len(),
+            attributes: Some(entry.attributes.clone()),
+        })
+    }
+
+    async fn write(
+        &self,
+        _context: &RequestContext,
+        object: ObjectKey,
+        offset: u64,
+        data: &[u8],
+        requested: WriteStability,
+    ) -> Result<MutationResult<WriteResult>, NfsError> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(Self::id(object)? as usize).ok_or(NfsError::Stale)?;
+        let before = Some(Self::wcc(&entry.attributes));
+        let Contents::File(bytes) = &mut entry.contents else {
+            return Err(NfsError::IsDirectory);
+        };
+        let start = usize::try_from(offset).map_err(|_| NfsError::FileTooLarge)?;
+        let end = start.checked_add(data.len()).ok_or(NfsError::FileTooLarge)?;
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[start..end].copy_from_slice(data);
+        entry.attributes.size = bytes.len() as u64;
+        entry.attributes.used = bytes.len() as u64;
+        entry.attributes.modify_time = now();
+        entry.attributes.change_time = entry.attributes.modify_time;
+        Ok(MutationResult {
+            value: WriteResult {
+                count: data.len() as u32,
+                committed: requested,
+            },
+            before,
+            after: Some(entry.attributes.clone()),
+        })
+    }
+
+    async fn create(
+        &self,
+        _context: &RequestContext,
+        parent: ObjectKey,
+        name: &NfsName,
+        attributes: SetAttributes,
+        mode: CreateMode,
+    ) -> Result<MutationResult<CreatedObject>, NfsError> {
+        let parent = Self::id(parent)?;
+        let mut entries = self.entries.lock().unwrap();
+        let directory = entries.get(parent as usize).ok_or(NfsError::Stale)?;
+        let Contents::Directory(children) = &directory.contents else {
+            return Err(NfsError::NotDirectory);
+        };
+        if let Some(existing) = children
+            .iter()
+            .filter_map(|id| entries.get(*id as usize))
+            .find(|entry| entry.name == name.as_bytes())
+        {
+            let replayed_exclusive = match mode {
+                CreateMode::Exclusive { verifier } => existing.exclusive_verifier == Some(verifier),
+                _ => false,
+            };
+            return if mode == CreateMode::Unchecked || replayed_exclusive {
+                Ok(MutationResult {
+                    value: Self::created(existing),
+                    before: Some(Self::wcc(&directory.attributes)),
+                    after: Some(directory.attributes.clone()),
+                })
+            } else {
+                Err(NfsError::Exists)
+            };
+        }
+        let before = Some(Self::wcc(&directory.attributes));
+        let id = entries.len() as u64;
+        let mut entry = make_file(name.as_bytes(), id, parent, &[]);
+        if let CreateMode::Exclusive { verifier } = mode {
+            entry.exclusive_verifier = Some(verifier);
+        }
+        Self::apply_attributes(&mut entry, attributes)?;
+        entries.push(entry);
+        let created = Self::created(entries.last().unwrap());
+        let directory = entries.get_mut(parent as usize).unwrap();
+        let Contents::Directory(children) = &mut directory.contents else {
+            unreachable!();
+        };
+        children.push(id);
+        directory.attributes.change_time = now();
+        Ok(MutationResult {
+            value: created,
+            before,
+            after: Some(directory.attributes.clone()),
+        })
     }
 
     async fn readdir(
         &self,
-        dirid: fileid3,
-        start_after: fileid3,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, nfsstat3> {
-        let fs = self.fs.lock().unwrap();
-        let entry = fs.get(dirid as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        if let FSContents::File(_) = entry.contents {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
-        } else if let FSContents::Directory(dir) = &entry.contents {
-            let mut ret = ReadDirResult {
-                entries: Vec::new(),
-                end: false,
-            };
-            let mut start_index = 0;
-            if start_after > 0 {
-                if let Some(pos) = dir.iter().position(|&r| r == start_after) {
-                    start_index = pos + 1;
-                } else {
-                    return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
-                }
-            }
-            let remaining_length = dir.len() - start_index;
-
-            for i in dir[start_index..].iter() {
-                ret.entries.push(DirEntry {
-                    fileid: *i,
-                    name: fs[(*i) as usize].name.clone(),
-                    attr: fs[(*i) as usize].attr,
-                });
-                if ret.entries.len() >= max_entries {
-                    break;
-                }
-            }
-            if ret.entries.len() == remaining_length {
-                ret.end = true;
-            }
-            return Ok(ret);
+        _context: &RequestContext,
+        directory: ObjectKey,
+        cookie: u64,
+        verifier: [u8; 8],
+        backend_hint: usize,
+    ) -> Result<ReadDirectoryPage, NfsError> {
+        if cookie != 0 && verifier != READDIR_VERIFIER {
+            return Err(NfsError::BadCookie);
         }
-        Err(nfsstat3::NFS3ERR_NOENT)
+        let entries = self.entries.lock().unwrap();
+        let directory = entries.get(Self::id(directory)? as usize).ok_or(NfsError::Stale)?;
+        let Contents::Directory(children) = &directory.contents else {
+            return Err(NfsError::NotDirectory);
+        };
+        let start = usize::try_from(cookie).unwrap_or(usize::MAX);
+        let page = children
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(backend_hint.max(1))
+            .filter_map(|(index, id)| entries.get(*id as usize).map(|entry| (index, entry)))
+            .map(|(index, entry)| DirectoryEntry {
+                object: Self::key(entry.id),
+                file_id: entry.id,
+                name: NfsName::new(entry.name.clone()).unwrap(),
+                cookie: index as u64 + 1,
+                attributes: Some(entry.attributes.clone()),
+            })
+            .collect::<Vec<_>>();
+        Ok(ReadDirectoryPage {
+            verifier: READDIR_VERIFIER,
+            eof: start.saturating_add(page.len()) >= children.len(),
+            entries: page,
+        })
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    #[allow(unused)]
-    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+    async fn fsstat(&self, _context: &RequestContext, _object: ObjectKey) -> Result<FsStat, NfsError> {
+        Ok(FsStat {
+            total_bytes: 1 << 30,
+            free_bytes: 1 << 29,
+            available_bytes: 1 << 29,
+            total_files: 1_000_000,
+            free_files: 999_000,
+            available_files: 999_000,
+            invariant_seconds: 1,
+        })
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    #[allow(unused)]
-    async fn rename(
-        &self,
-        from_dirid: fileid3,
-        from_filename: &filename3,
-        to_dirid: fileid3,
-        to_filename: &filename3,
-    ) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+    async fn fsinfo(&self, _context: &RequestContext, _object: ObjectKey) -> Result<FsInfo, NfsError> {
+        Ok(default_fs_info())
     }
 
-    #[allow(unused)]
-    async fn mkdir(&self, _dirid: fileid3, _dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-
-    async fn symlink(
-        &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
-        _attr: &sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
-    }
-    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+    async fn pathconf(&self, _context: &RequestContext, _object: ObjectKey) -> Result<PathConf, NfsError> {
+        Ok(default_path_conf())
     }
 }
 
-const HOSTPORT: u32 = 11111;
+fn default_fs_info() -> FsInfo {
+    FsInfo {
+        max_read: 1024 * 1024,
+        preferred_read: 128 * 1024,
+        read_multiple: 4096,
+        max_write: 1024 * 1024,
+        preferred_write: 128 * 1024,
+        write_multiple: 4096,
+        preferred_readdir: 32 * 1024,
+        max_file_size: 128 * 1024 * 1024 * 1024,
+        time_granularity: NfsTime {
+            seconds: 0,
+            nanoseconds: 1_000_000,
+        },
+    }
+}
+
+fn default_path_conf() -> PathConf {
+    PathConf {
+        max_links: u32::MAX,
+        max_name_length: NfsName::MAX_LEN as u32,
+        no_truncation: true,
+        chown_restricted: true,
+        case_insensitive: false,
+        case_preserving: true,
+    }
+}
+
+const HOST_PORT: u16 = 11111;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), DemoFS::default())
-        .await
-        .unwrap();
-    listener.handle_forever().await.unwrap();
+
+    let listener = TcpListener::bind(("127.0.0.1", HOST_PORT)).await?;
+    let server = NfsServer::builder(DemoFs::default())
+        .auth_policy(AuthPolicy::AuthSysOrAnonymous)
+        .build()?;
+    server.serve(listener, std::future::pending()).await?;
+    Ok(())
 }
-// Test with
-// mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/
+
+// Test with:
+// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/

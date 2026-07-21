@@ -3,8 +3,10 @@
 // And its nice to keep the original RFC names and case
 #![allow(non_camel_case_types)]
 
+#[cfg(feature = "demo")]
 use std::io::{Read, Write};
 
+#[cfg(feature = "demo")]
 use crate::xdr::*;
 // Transcribed from RFC 1057 Appendix A
 
@@ -18,6 +20,7 @@ pub struct mapping {
     pub prot: u32,
     pub port: u32,
 }
+#[cfg(feature = "demo")]
 xdr_struct!(mapping, prog, vers, prot, port);
 pub const IPPROTO_TCP: u32 = 6; /* protocol number for TCP/IP */
 pub const IPPROTO_UDP: u32 = 17; /* protocol number for UDP/IP */

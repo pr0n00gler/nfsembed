@@ -1,0 +1,66 @@
+[package]
+name = "nfsserve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+nfsserve = { path = ".." }
+tokio = { version = "1", features = ["io-util", "rt", "sync"] }
+
+[[bin]]
+name = "rpc_codec"
+path = "fuzz_targets/rpc_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_auth"
+path = "fuzz_targets/rpc_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_record"
+path = "fuzz_targets/rpc_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_handle"
+path = "fuzz_targets/file_handle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nfs_write"
+path = "fuzz_targets/nfs_write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nfs_readdir"
+path = "fuzz_targets/nfs_readdir.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay"
+path = "fuzz_targets/replay.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

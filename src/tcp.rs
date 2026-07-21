@@ -7,13 +7,18 @@ use anyhow;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info};
 
 use crate::context::RPCContext;
 use crate::rpcwire::*;
 use crate::transaction_tracker::TransactionTracker;
-use crate::vfs::NFSFileSystem;
+use crate::vfs::legacy::NFSFileSystem;
+
+const MAX_LEGACY_CONNECTIONS: usize = 1024;
+// Record readers share this listener-wide pool so opening more connections
+// cannot multiply the aggregate request allocation limit.
+const MAX_LEGACY_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
@@ -23,6 +28,8 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    connections: Arc<Semaphore>,
+    request_buffers: Arc<Semaphore>,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -30,11 +37,21 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 }
 
 /// processes an established socket
-async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
+async fn process_socket(
+    mut socket: tokio::net::TcpStream,
+    context: RPCContext,
+    request_buffers: Arc<Semaphore>,
+    _connection_permit: Arc<OwnedSemaphorePermit>,
+) -> Result<(), anyhow::Error> {
+    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context, request_buffers);
     let _ = socket.set_nodelay(true);
 
+    // The socket pump and record reader are separate tasks. Both retain the
+    // same permit so a timed-out or disconnected pump cannot free a listener
+    // slot while its reader is still unwinding or waiting on the byte budget.
+    let handler_connection_permit = _connection_permit.clone();
     tokio::spawn(async move {
+        let _connection_permit = handler_connection_permit;
         loop {
             if let Err(e) = message_handler.read().await {
                 debug!("Message loop broken due to {:?}", e);
@@ -159,6 +176,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            connections: Arc::new(Semaphore::new(MAX_LEGACY_CONNECTIONS)),
+            request_buffers: Arc::new(Semaphore::new(MAX_LEGACY_BUFFERED_REQUEST_BYTES)),
         })
     }
 
@@ -195,6 +214,12 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
         loop {
+            let connection_permit = self
+                .connections
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("legacy connection semaphore remains open");
             let (socket, _) = self.listener.accept().await?;
             let context = RPCContext {
                 local_port: self.port,
@@ -207,8 +232,10 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
+            let request_buffers = self.request_buffers.clone();
             tokio::spawn(async move {
-                let _ = process_socket(socket, context).await;
+                let connection_permit = Arc::new(connection_permit);
+                let _ = process_socket(socket, context, request_buffers, connection_permit).await;
             });
         }
     }
