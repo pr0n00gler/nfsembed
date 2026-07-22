@@ -17,6 +17,7 @@ pub struct MountInfo {
 
 pub struct ServerHandle {
     mount_infos: Vec<MountInfo>,
+    portmapper_addr: Option<SocketAddr>,
     shutdown: watch::Sender<bool>,
     task: SharedServerTask,
 }
@@ -26,11 +27,13 @@ type SharedServerTask = Arc<Mutex<Option<JoinHandle<Result<(), ServerError>>>>>;
 impl ServerHandle {
     pub(crate) fn new(
         mount_infos: Vec<MountInfo>,
+        portmapper_addr: Option<SocketAddr>,
         shutdown: watch::Sender<bool>,
         task: JoinHandle<Result<(), ServerError>>,
     ) -> Self {
         Self {
             mount_infos,
+            portmapper_addr,
             shutdown,
             task: Arc::new(Mutex::new(Some(task))),
         }
@@ -42,6 +45,11 @@ impl ServerHandle {
 
     pub fn mount_infos(&self) -> &[MountInfo] {
         &self.mount_infos
+    }
+
+    /// Returns the shared TCP/UDP portmapper address, when configured.
+    pub fn portmapper_addr(&self) -> Option<SocketAddr> {
+        self.portmapper_addr
     }
 
     /// Requests shutdown. Calling this more than once is harmless.
@@ -68,6 +76,7 @@ impl std::fmt::Debug for ServerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerHandle")
             .field("mount_infos", &self.mount_infos)
+            .field("portmapper_addr", &self.portmapper_addr)
             .finish_non_exhaustive()
     }
 }
@@ -92,7 +101,7 @@ mod tests {
         let task = tokio::spawn(async { Ok(()) });
         task.abort();
         let (shutdown, _) = watch::channel(false);
-        let handle = ServerHandle::new(Vec::new(), shutdown, task);
+        let handle = ServerHandle::new(Vec::new(), None, shutdown, task);
 
         assert!(matches!(handle.wait().await, Err(ServerError::Task(_))));
         assert!(handle.wait().await.is_ok());

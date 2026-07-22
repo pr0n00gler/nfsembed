@@ -31,7 +31,7 @@ pub mod observability;
 pub mod replay;
 pub mod server;
 
-#[cfg(all(feature = "demo", not(target_os = "windows")))]
+#[cfg(all(feature = "demo", any(unix, windows)))]
 pub mod fs_util;
 
 #[cfg(feature = "demo")]
@@ -41,6 +41,7 @@ mod transaction_tracker;
 pub mod vfs;
 
 pub use server::{
-    AuthPolicy, MountInfo, NfsServer, NfsServerBuilder, PortmapperMode, ServerError, ServerHandle, ServerLimits,
+    AuthPolicy, MountInfo, NfsServer, NfsServerBuilder, PortmapperMode, PortmapperSockets, ServerError, ServerHandle,
+    ServerLimits,
 };
 pub use vfs::{ExportId, Principal, RequestContext, VirtualFileSystem};

@@ -1,11 +1,21 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{Metadata, Permissions};
+use std::fs::Metadata;
 use std::io;
 use std::io::SeekFrom;
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfsserve::vfs::{
@@ -13,31 +23,42 @@ use nfsserve::vfs::{
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
-use nfsserve::{AuthPolicy, NfsServer};
+#[cfg(feature = "demo")]
+use nfsserve::{AuthPolicy, NfsServer, PortmapperSockets};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+#[cfg(feature = "demo")]
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::debug;
 
 const ROOT_ID: u64 = 1;
 const GENERATION: u64 = 1;
+
+#[cfg(unix)]
+type RelativeKey = Vec<OsString>;
+#[cfg(windows)]
+type RelativeKey = Vec<Vec<u16>>;
+type ExclusiveVerifierBucket = Vec<(Vec<OsString>, [u8; 8])>;
 
 #[derive(Debug)]
 struct FsMap {
     root: PathBuf,
     next_file_id: u64,
     id_to_relative: HashMap<u64, Vec<OsString>>,
-    relative_to_id: HashMap<Vec<OsString>, u64>,
-    exclusive_verifiers: HashMap<Vec<OsString>, [u8; 8]>,
+    id_to_key: HashMap<u64, RelativeKey>,
+    relative_to_id: HashMap<RelativeKey, Vec<u64>>,
+    exclusive_verifiers: HashMap<RelativeKey, ExclusiveVerifierBucket>,
 }
 
 impl FsMap {
     fn new(root: PathBuf) -> Self {
+        let root_key = RelativeKey::new();
         Self {
             root,
             next_file_id: ROOT_ID + 1,
             id_to_relative: HashMap::from([(ROOT_ID, Vec::new())]),
-            relative_to_id: HashMap::from([(Vec::new(), ROOT_ID)]),
+            id_to_key: HashMap::from([(ROOT_ID, root_key.clone())]),
+            relative_to_id: HashMap::from([(root_key, vec![ROOT_ID])]),
             exclusive_verifiers: HashMap::new(),
         }
     }
@@ -57,53 +78,144 @@ impl FsMap {
 
     fn child_relative(&self, parent: ObjectKey, name: &NfsName) -> Result<Vec<OsString>, NfsError> {
         let mut relative = self.relative(parent)?;
-        relative.push(OsString::from_vec(name.as_bytes().to_vec()));
+        relative.push(nfs_name_to_os_string(name)?);
         Ok(relative)
     }
 
-    fn intern(&mut self, relative: Vec<OsString>) -> u64 {
-        if let Some(file_id) = self.relative_to_id.get(&relative) {
-            return *file_id;
+    fn intern(&mut self, relative: Vec<OsString>) -> Result<u64, NfsError> {
+        let key = relative_key(&relative)?;
+        if let Some(file_ids) = self.relative_to_id.get(&key) {
+            if let Some(file_id) = file_ids.iter().find(|file_id| {
+                self.id_to_relative
+                    .get(file_id)
+                    .is_some_and(|candidate| relative_eq(candidate, &relative))
+            }) {
+                return Ok(*file_id);
+            }
         }
         let file_id = self.next_file_id;
         self.next_file_id += 1;
-        self.id_to_relative.insert(file_id, relative.clone());
-        self.relative_to_id.insert(relative, file_id);
-        file_id
+        self.id_to_relative.insert(file_id, relative);
+        self.id_to_key.insert(file_id, key.clone());
+        self.relative_to_id.entry(key).or_default().push(file_id);
+        Ok(file_id)
     }
 
-    fn forget_prefix(&mut self, prefix: &[OsString]) {
-        let forgotten = self
-            .id_to_relative
-            .iter()
-            .filter(|(_, relative)| relative.starts_with(prefix))
-            .map(|(file_id, relative)| (*file_id, relative.clone()))
-            .collect::<Vec<_>>();
-        for (file_id, relative) in forgotten {
-            self.id_to_relative.remove(&file_id);
-            self.relative_to_id.remove(&relative);
-            self.exclusive_verifiers.remove(&relative);
+    fn remove_indexed_id(&mut self, key: &RelativeKey, file_id: u64) {
+        let remove_key = if let Some(file_ids) = self.relative_to_id.get_mut(key) {
+            file_ids.retain(|candidate| *candidate != file_id);
+            file_ids.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            self.relative_to_id.remove(key);
         }
     }
 
-    fn move_prefix(&mut self, from: &[OsString], to: &[OsString]) {
-        self.forget_prefix(to);
-        let moved = self
-            .id_to_relative
+    fn forget_prefix(&mut self, prefix: &[OsString]) -> Result<(), NfsError> {
+        let prefix_key = relative_key(prefix)?;
+        let forgotten = self
+            .id_to_key
             .iter()
-            .filter(|(_, relative)| relative.starts_with(from))
-            .map(|(file_id, relative)| (*file_id, relative.clone()))
+            .filter(|(file_id, key)| {
+                key.starts_with(&prefix_key)
+                    && self
+                        .id_to_relative
+                        .get(file_id)
+                        .is_some_and(|relative| relative_starts_with(relative, prefix))
+            })
+            .map(|(file_id, _)| *file_id)
             .collect::<Vec<_>>();
-        for (file_id, old_relative) in moved {
-            let mut new_relative = to.to_vec();
-            new_relative.extend_from_slice(&old_relative[from.len()..]);
-            self.id_to_relative.insert(file_id, new_relative.clone());
-            self.relative_to_id.remove(&old_relative);
-            self.relative_to_id.insert(new_relative.clone(), file_id);
-            if let Some(verifier) = self.exclusive_verifiers.remove(&old_relative) {
-                self.exclusive_verifiers.insert(new_relative, verifier);
+        for file_id in forgotten {
+            self.id_to_relative.remove(&file_id);
+            if let Some(key) = self.id_to_key.remove(&file_id) {
+                self.remove_indexed_id(&key, file_id);
             }
         }
+        self.exclusive_verifiers.retain(|key, verifiers| {
+            if key.starts_with(&prefix_key) {
+                verifiers.retain(|(relative, _)| !relative_starts_with(relative, prefix));
+            }
+            !verifiers.is_empty()
+        });
+        Ok(())
+    }
+
+    fn move_prefix(&mut self, from: &[OsString], to: &[OsString]) -> Result<(), NfsError> {
+        let from_key = relative_key(from)?;
+        let to_key = relative_key(to)?;
+        if !relative_eq(from, to) {
+            self.forget_prefix(to)?;
+        }
+        let moved = self
+            .id_to_key
+            .iter()
+            .filter(|(file_id, key)| {
+                key.starts_with(&from_key)
+                    && self
+                        .id_to_relative
+                        .get(file_id)
+                        .is_some_and(|relative| relative_starts_with(relative, from))
+            })
+            .map(|(file_id, key)| (*file_id, key.clone()))
+            .collect::<Vec<_>>();
+        for (file_id, old_key) in moved {
+            let old_relative = self.id_to_relative.get(&file_id).cloned().ok_or(NfsError::Stale)?;
+            let mut new_relative = to.to_vec();
+            new_relative.extend_from_slice(&old_relative[from.len()..]);
+            let mut new_key = to_key.clone();
+            new_key.extend_from_slice(&old_key[from_key.len()..]);
+
+            self.id_to_relative.insert(file_id, new_relative.clone());
+            self.id_to_key.insert(file_id, new_key.clone());
+            self.remove_indexed_id(&old_key, file_id);
+            self.relative_to_id.entry(new_key.clone()).or_default().push(file_id);
+            if let Some(verifier) = self.take_exclusive_verifier(&old_key, &old_relative) {
+                self.exclusive_verifiers
+                    .entry(new_key)
+                    .or_default()
+                    .push((new_relative, verifier));
+            }
+        }
+        Ok(())
+    }
+
+    fn exclusive_verifier(&self, relative: &[OsString]) -> Result<Option<[u8; 8]>, NfsError> {
+        Ok(self.exclusive_verifiers.get(&relative_key(relative)?).and_then(|verifiers| {
+            verifiers
+                .iter()
+                .find(|(candidate, _)| relative_eq(candidate, relative))
+                .map(|(_, verifier)| *verifier)
+        }))
+    }
+
+    fn remember_exclusive_verifier(&mut self, relative: &[OsString], verifier: [u8; 8]) -> Result<(), NfsError> {
+        let verifiers = self.exclusive_verifiers.entry(relative_key(relative)?).or_default();
+        verifiers.retain(|(candidate, _)| !relative_eq(candidate, relative));
+        verifiers.push((relative.to_vec(), verifier));
+        Ok(())
+    }
+
+    fn take_exclusive_verifier(&mut self, key: &RelativeKey, relative: &[OsString]) -> Option<[u8; 8]> {
+        let mut verifier = None;
+        let remove_key = if let Some(verifiers) = self.exclusive_verifiers.get_mut(key) {
+            verifiers.retain(|(candidate, candidate_verifier)| {
+                if relative_eq(candidate, relative) {
+                    verifier = Some(*candidate_verifier);
+                    false
+                } else {
+                    true
+                }
+            });
+            verifiers.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            self.exclusive_verifiers.remove(key);
+        }
+        verifier
     }
 }
 
@@ -139,13 +251,13 @@ impl MirrorFs {
         Ok((relative, path))
     }
 
-    async fn created(&self, relative: Vec<OsString>, metadata: Metadata) -> CreatedObject {
+    async fn created(&self, relative: Vec<OsString>, metadata: Metadata) -> Result<CreatedObject, NfsError> {
         let mut map = self.map.lock().await;
-        let file_id = map.intern(relative);
-        CreatedObject {
+        let file_id = map.intern(relative)?;
+        Ok(CreatedObject {
             object: Self::key(file_id),
             attributes: Some(metadata_to_attributes(file_id, &metadata)),
-        }
+        })
     }
 
     async fn parent_snapshot(&self, parent: ObjectKey) -> Result<(Option<WccAttributes>, PathBuf), NfsError> {
@@ -159,8 +271,9 @@ impl MirrorFs {
         parent: ObjectKey,
         name: &NfsName,
         attributes: SetAttributes,
-        kind: CreateKind<'_>,
+        kind: CreateKind,
     ) -> Result<MutationResult<CreatedObject>, NfsError> {
+        validate_attributes(&attributes)?;
         let (before, parent_path) = self.parent_snapshot(parent).await?;
         if !tokio::fs::symlink_metadata(&parent_path).await.map_err(map_io_error)?.is_dir() {
             return Err(NfsError::NotDirectory);
@@ -172,7 +285,7 @@ impl MirrorFs {
                 if let CreateMode::Exclusive { verifier } = mode {
                     if tokio::fs::symlink_metadata(&path).await.is_ok() {
                         let map = self.map.lock().await;
-                        if map.exclusive_verifiers.get(&relative) != Some(&verifier) {
+                        if map.exclusive_verifier(&relative)? != Some(verifier) {
                             return Err(NfsError::Exists);
                         }
                     } else {
@@ -182,7 +295,7 @@ impl MirrorFs {
                             .open(&path)
                             .await
                             .map_err(map_io_error)?;
-                        self.map.lock().await.exclusive_verifiers.insert(relative.clone(), verifier);
+                        self.map.lock().await.remember_exclusive_verifier(&relative, verifier)?;
                     }
                 } else {
                     let mut options = OpenOptions::new();
@@ -204,15 +317,14 @@ impl MirrorFs {
                 tokio::fs::create_dir(&path).await.map_err(map_io_error)?;
                 apply_attributes(&path, &attributes).await?;
             },
+            #[cfg(unix)]
             CreateKind::Symlink(target) => {
-                tokio::fs::symlink(OsStr::from_bytes(target), &path)
-                    .await
-                    .map_err(map_io_error)?;
+                create_symlink(&target, &path).await?;
             },
         }
 
         let metadata = tokio::fs::symlink_metadata(&path).await.map_err(map_io_error)?;
-        let created = self.created(relative, metadata).await;
+        let created = self.created(relative, metadata).await?;
         let after = tokio::fs::symlink_metadata(parent_path)
             .await
             .ok()
@@ -244,7 +356,7 @@ impl MirrorFs {
             }
             tokio::fs::remove_file(&path).await.map_err(map_io_error)?;
         }
-        self.map.lock().await.forget_prefix(&relative);
+        self.map.lock().await.forget_prefix(&relative)?;
         let after = tokio::fs::symlink_metadata(parent_path)
             .await
             .ok()
@@ -257,10 +369,11 @@ impl MirrorFs {
     }
 }
 
-enum CreateKind<'a> {
+enum CreateKind {
     File(CreateMode),
     Directory,
-    Symlink(&'a [u8]),
+    #[cfg(unix)]
+    Symlink(Vec<u8>),
 }
 
 #[async_trait]
@@ -268,6 +381,7 @@ impl VirtualFileSystem for MirrorFs {
     fn capabilities(&self) -> VfsCapabilities {
         VfsCapabilities {
             hard_links: false,
+            symbolic_links: cfg!(unix),
             mknod: false,
             ..VfsCapabilities::READ_WRITE
         }
@@ -298,7 +412,7 @@ impl VirtualFileSystem for MirrorFs {
             }
             let path = map.path(&relative);
             let metadata = tokio::fs::symlink_metadata(path).await.map_err(map_io_error)?;
-            let file_id = map.intern(relative);
+            let file_id = map.intern(relative)?;
             return Ok(CreatedObject {
                 object: Self::key(file_id),
                 attributes: Some(metadata_to_attributes(file_id, &metadata)),
@@ -306,7 +420,7 @@ impl VirtualFileSystem for MirrorFs {
         }
         let (relative, path) = self.child_path(parent, name).await?;
         let metadata = tokio::fs::symlink_metadata(&path).await.map_err(map_io_error)?;
-        Ok(self.created(relative, metadata).await)
+        self.created(relative, metadata).await
     }
 
     async fn access(&self, _context: &RequestContext, _object: ObjectKey, requested: u32) -> Result<u32, NfsError> {
@@ -344,11 +458,8 @@ impl VirtualFileSystem for MirrorFs {
         {
             return Err(NfsError::BadType);
         }
-        Ok(tokio::fs::read_link(path)
-            .await
-            .map_err(map_io_error)?
-            .into_os_string()
-            .into_vec())
+        let target = tokio::fs::read_link(path).await.map_err(map_io_error)?;
+        os_path_to_nfs_bytes(target.as_os_str())
     }
 
     async fn read(
@@ -451,7 +562,14 @@ impl VirtualFileSystem for MirrorFs {
         target: &[u8],
         attributes: SetAttributes,
     ) -> Result<MutationResult<CreatedObject>, NfsError> {
-        self.create_object(parent, name, attributes, CreateKind::Symlink(target)).await
+        #[cfg(windows)]
+        {
+            let _ = (parent, name, target, attributes);
+            return Err(NfsError::NotSupported);
+        }
+        #[cfg(unix)]
+        self.create_object(parent, name, attributes, CreateKind::Symlink(target.to_vec()))
+            .await
     }
 
     async fn remove(
@@ -484,8 +602,8 @@ impl VirtualFileSystem for MirrorFs {
         let (to_before, to_parent_path) = self.parent_snapshot(to_parent).await?;
         let (from_relative, from_path) = self.child_path(from_parent, from_name).await?;
         let (to_relative, to_path) = self.child_path(to_parent, to_name).await?;
-        tokio::fs::rename(&from_path, &to_path).await.map_err(map_io_error)?;
-        self.map.lock().await.move_prefix(&from_relative, &to_relative);
+        rename_host_path(&from_path, &to_path, relative_eq(&from_relative, &to_relative)).await?;
+        self.map.lock().await.move_prefix(&from_relative, &to_relative)?;
         let from_after = tokio::fs::symlink_metadata(from_parent_path)
             .await
             .ok()
@@ -530,26 +648,27 @@ impl VirtualFileSystem for MirrorFs {
         let mut children = Vec::new();
         while let Some(entry) = reader.next_entry().await.map_err(map_io_error)? {
             let path = entry.path();
+            let name = entry.file_name();
             children.push((
-                entry.file_name(),
+                os_component_to_nfs_bytes(name.as_os_str())?,
                 path.clone(),
                 tokio::fs::symlink_metadata(path).await.map_err(map_io_error)?,
             ));
         }
-        children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        children.sort_by(|left, right| left.0.cmp(&right.0));
 
         let start = usize::try_from(cookie).unwrap_or(usize::MAX);
         let selected = children.iter().skip(start).take(backend_hint.max(1));
         let mut entries = Vec::new();
-        for (index, (name, _path, metadata)) in selected.enumerate() {
-            let nfs_name = NfsName::new(name.as_bytes().to_vec())?;
+        for (index, (name_bytes, _path, metadata)) in selected.enumerate() {
+            let nfs_name = NfsName::new(name_bytes.clone())?;
             let relative = {
                 let map = self.map.lock().await;
                 let mut relative = map.relative(directory)?;
-                relative.push(name.clone());
+                relative.push(nfs_name_to_os_string(&nfs_name)?);
                 relative
             };
-            let file_id = self.map.lock().await.intern(relative);
+            let file_id = self.map.lock().await.intern(relative)?;
             entries.push(DirectoryEntry {
                 object: Self::key(file_id),
                 file_id,
@@ -602,7 +721,7 @@ impl VirtualFileSystem for MirrorFs {
             max_name_length: NfsName::MAX_LEN as u32,
             no_truncation: true,
             chown_restricted: true,
-            case_insensitive: false,
+            case_insensitive: cfg!(windows),
             case_preserving: true,
         })
     }
@@ -634,6 +753,258 @@ impl VirtualFileSystem for MirrorFs {
     }
 }
 
+#[cfg(unix)]
+fn nfs_name_to_os_string(name: &NfsName) -> Result<OsString, NfsError> {
+    Ok(OsString::from_vec(name.as_bytes().to_vec()))
+}
+
+#[cfg(windows)]
+fn nfs_name_to_os_string(name: &NfsName) -> Result<OsString, NfsError> {
+    let value = std::str::from_utf8(name.as_bytes()).map_err(|_| NfsError::Invalid)?;
+    if !valid_windows_component(value) {
+        return Err(NfsError::Invalid);
+    }
+    Ok(OsString::from(value))
+}
+
+#[cfg(any(test, windows))]
+fn valid_windows_component(value: &str) -> bool {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.ends_with([' ', '.'])
+        || value
+            .chars()
+            .any(|character| character <= '\u{1f}' || r#"<>:"/\|?*"#.contains(character))
+    {
+        return false;
+    }
+    let stem = value.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !matches!(
+            stem.strip_prefix("COM"),
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        )
+        && !matches!(
+            stem.strip_prefix("LPT"),
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        )
+}
+
+#[cfg(unix)]
+fn relative_eq(left: &[OsString], right: &[OsString]) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn relative_eq(left: &[OsString], right: &[OsString]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| windows_component_eq(left, right))
+}
+
+#[cfg(unix)]
+fn relative_starts_with(relative: &[OsString], prefix: &[OsString]) -> bool {
+    relative.starts_with(prefix)
+}
+
+#[cfg(windows)]
+fn relative_starts_with(relative: &[OsString], prefix: &[OsString]) -> bool {
+    relative.len() >= prefix.len()
+        && relative
+            .iter()
+            .zip(prefix)
+            .all(|(component, prefix)| windows_component_eq(component, prefix))
+}
+
+#[cfg(unix)]
+fn relative_key(relative: &[OsString]) -> Result<RelativeKey, NfsError> {
+    Ok(relative.to_vec())
+}
+
+#[cfg(windows)]
+fn relative_key(relative: &[OsString]) -> Result<RelativeKey, NfsError> {
+    relative.iter().map(|component| windows_component_key(component)).collect()
+}
+
+#[cfg(windows)]
+fn windows_component_eq(left: &OsStr, right: &OsStr) -> bool {
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len())) else {
+        return false;
+    };
+    // SAFETY: both pointers remain valid for the explicit lengths supplied to
+    // CompareStringOrdinal, and the function does not retain either pointer.
+    unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL }
+}
+
+#[cfg(windows)]
+fn windows_component_key(value: &OsStr) -> Result<Vec<u16>, NfsError> {
+    use std::ptr;
+
+    use windows_sys::Win32::Globalization::{LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT};
+
+    let value = value.encode_wide().collect::<Vec<_>>();
+    let value_len = i32::try_from(value.len()).map_err(|_| NfsError::NameTooLong)?;
+    // SAFETY: the source pointer is valid for `value_len` code units and the
+    // null output pointer requests the required output size.
+    let key_len = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            value.as_ptr(),
+            value_len,
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if key_len == 0 {
+        return Err(map_io_error(io::Error::last_os_error()));
+    }
+    let mut key = vec![0; key_len as usize];
+    // SAFETY: `key` has the exact capacity reported by the sizing call, and
+    // neither input nor output pointer is retained by LCMapStringEx.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            value.as_ptr(),
+            value_len,
+            key.as_mut_ptr(),
+            key_len,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if written != key_len {
+        return Err(map_io_error(io::Error::last_os_error()));
+    }
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn os_component_to_nfs_bytes(value: &OsStr) -> Result<Vec<u8>, NfsError> {
+    Ok(value.as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn os_component_to_nfs_bytes(value: &OsStr) -> Result<Vec<u8>, NfsError> {
+    let value = value.to_str().ok_or(NfsError::Invalid)?;
+    if !valid_windows_component(value) {
+        return Err(NfsError::Invalid);
+    }
+    Ok(value.as_bytes().to_vec())
+}
+
+#[cfg(unix)]
+fn os_path_to_nfs_bytes(value: &OsStr) -> Result<Vec<u8>, NfsError> {
+    Ok(value.as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn os_path_to_nfs_bytes(value: &OsStr) -> Result<Vec<u8>, NfsError> {
+    Ok(value.to_str().ok_or(NfsError::Invalid)?.as_bytes().to_vec())
+}
+
+#[cfg(unix)]
+async fn create_symlink(target: &[u8], path: &Path) -> Result<(), NfsError> {
+    tokio::fs::symlink(OsStr::from_bytes(target), path).await.map_err(map_io_error)
+}
+
+#[cfg(unix)]
+async fn rename_host_path(from: &Path, to: &Path, _case_only: bool) -> Result<(), NfsError> {
+    tokio::fs::rename(from, to).await.map_err(map_io_error)
+}
+
+#[cfg(windows)]
+async fn rename_host_path(from: &Path, to: &Path, case_only: bool) -> Result<(), NfsError> {
+    if !case_only || from == to {
+        return tokio::fs::rename(from, to).await.map_err(map_io_error);
+    }
+
+    let from = from.to_path_buf();
+    let to = to.to_path_buf();
+    tokio::task::spawn_blocking(move || rename_host_path_case_only(&from, &to))
+        .await
+        .map_err(|_| NfsError::Io)?
+}
+
+#[cfg(windows)]
+fn rename_host_path_case_only(from: &Path, to: &Path) -> Result<(), NfsError> {
+    use std::ffi::c_void;
+    use std::mem::{offset_of, size_of};
+    use std::ptr;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    };
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(from)
+        .map_err(map_io_error)?;
+    let destination = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(map_io_error)?.join(to)
+    };
+    let destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = destination.len().checked_mul(size_of::<u16>()).ok_or(NfsError::NameTooLong)?;
+    let name_bytes = u32::try_from(name_bytes).map_err(|_| NfsError::NameTooLong)?;
+    let header_bytes = offset_of!(FILE_RENAME_INFO, FileName);
+    let total_bytes = header_bytes
+        .checked_add(name_bytes as usize)
+        .and_then(|size| size.checked_add(size_of::<u16>()))
+        .ok_or(NfsError::NameTooLong)?;
+    let word_bytes = size_of::<usize>();
+    let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    // SAFETY: `storage` is aligned for FILE_RENAME_INFO and sized for the
+    // header, the complete UTF-16 destination name, and its trailing NUL.
+    // SetFileInformationByHandle consumes the buffer during the call and does
+    // not retain it.
+    let succeeded = unsafe {
+        ptr::write(
+            info,
+            FILE_RENAME_INFO {
+                Anonymous: FILE_RENAME_INFO_0 {
+                    Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+                },
+                RootDirectory: ptr::null_mut(),
+                FileNameLength: name_bytes,
+                FileName: [0],
+            },
+        );
+        ptr::copy_nonoverlapping(destination.as_ptr(), (*info).FileName.as_mut_ptr(), destination.len());
+        *(*info).FileName.as_mut_ptr().add(destination.len()) = 0;
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileRenameInfo,
+            info.cast::<c_void>(),
+            u32::try_from(total_bytes).map_err(|_| NfsError::NameTooLong)?,
+        )
+    };
+    if succeeded == 0 {
+        return Err(map_io_error(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn map_io_error(error: io::Error) -> NfsError {
     match error.kind() {
         io::ErrorKind::NotFound => NfsError::NotFound,
@@ -641,17 +1012,37 @@ fn map_io_error(error: io::Error) -> NfsError {
         io::ErrorKind::AlreadyExists => NfsError::Exists,
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => NfsError::Invalid,
         io::ErrorKind::StorageFull => NfsError::NoSpace,
-        _ => match error.raw_os_error() {
-            Some(18) => NfsError::CrossDevice,
-            Some(20) => NfsError::NotDirectory,
-            Some(21) => NfsError::IsDirectory,
-            Some(36) => NfsError::NameTooLong,
-            Some(39) | Some(66) => NfsError::NotEmpty,
-            _ => NfsError::Io,
-        },
+        _ => error.raw_os_error().and_then(map_raw_os_error).unwrap_or(NfsError::Io),
     }
 }
 
+#[cfg(unix)]
+fn map_raw_os_error(error: i32) -> Option<NfsError> {
+    match error {
+        18 => Some(NfsError::CrossDevice),
+        20 => Some(NfsError::NotDirectory),
+        21 => Some(NfsError::IsDirectory),
+        36 => Some(NfsError::NameTooLong),
+        39 | 66 => Some(NfsError::NotEmpty),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn map_raw_os_error(error: i32) -> Option<NfsError> {
+    match error {
+        3 => Some(NfsError::NotFound),
+        5 => Some(NfsError::Access),
+        17 => Some(NfsError::CrossDevice),
+        87 => Some(NfsError::Invalid),
+        112 => Some(NfsError::NoSpace),
+        145 => Some(NfsError::NotEmpty),
+        206 => Some(NfsError::NameTooLong),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
 fn metadata_time(seconds: i64, nanoseconds: i64) -> NfsTime {
     NfsTime {
         seconds: seconds.max(0) as u64,
@@ -659,9 +1050,19 @@ fn metadata_time(seconds: i64, nanoseconds: i64) -> NfsTime {
     }
 }
 
-fn metadata_to_attributes(file_id: u64, metadata: &Metadata) -> FileAttributes {
+#[cfg(windows)]
+fn metadata_time(time: SystemTime) -> NfsTime {
+    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    NfsTime {
+        seconds: duration.as_secs(),
+        nanoseconds: duration.subsec_nanos(),
+    }
+}
+
+#[cfg(unix)]
+fn metadata_file_type(metadata: &Metadata) -> FileType {
     let os_type = metadata.file_type();
-    let file_type = if os_type.is_file() {
+    if os_type.is_file() {
         FileType::Regular
     } else if os_type.is_dir() {
         FileType::Directory
@@ -675,47 +1076,122 @@ fn metadata_to_attributes(file_id: u64, metadata: &Metadata) -> FileAttributes {
         FileType::Socket
     } else {
         FileType::Fifo
+    }
+}
+
+#[cfg(windows)]
+fn metadata_file_type(metadata: &Metadata) -> FileType {
+    let os_type = metadata.file_type();
+    if os_type.is_dir() {
+        FileType::Directory
+    } else if os_type.is_symlink() {
+        FileType::Symlink
+    } else {
+        FileType::Regular
+    }
+}
+
+#[cfg(unix)]
+fn metadata_platform_attributes(metadata: &Metadata) -> (u32, u32, u32, u32, u64, u64, NfsTime, NfsTime, NfsTime) {
+    (
+        metadata.permissions().mode() & 0o7777,
+        metadata.nlink() as u32,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.blocks().saturating_mul(512),
+        metadata.dev(),
+        metadata_time(metadata.atime(), metadata.atime_nsec()),
+        metadata_time(metadata.mtime(), metadata.mtime_nsec()),
+        metadata_time(metadata.ctime(), metadata.ctime_nsec()),
+    )
+}
+
+#[cfg(windows)]
+fn metadata_platform_attributes(metadata: &Metadata) -> (u32, u32, u32, u32, u64, u64, NfsTime, NfsTime, NfsTime) {
+    let base_mode = if metadata.is_dir() { 0o555 } else { 0o444 };
+    let mode = if metadata.permissions().readonly() {
+        base_mode
+    } else {
+        base_mode | 0o222
     };
+    let access_time = metadata_time(metadata.accessed().unwrap_or(UNIX_EPOCH));
+    let modify_time = metadata_time(metadata.modified().unwrap_or(UNIX_EPOCH));
+    let change_time = metadata_time(metadata.modified().or_else(|_| metadata.created()).unwrap_or(UNIX_EPOCH));
+    (
+        mode,
+        if metadata.is_dir() { 2 } else { 1 },
+        0,
+        0,
+        metadata.len(),
+        0,
+        access_time,
+        modify_time,
+        change_time,
+    )
+}
+
+fn metadata_to_attributes(file_id: u64, metadata: &Metadata) -> FileAttributes {
+    let (mode, links, uid, gid, used, fs_id, access_time, modify_time, change_time) =
+        metadata_platform_attributes(metadata);
     FileAttributes {
-        file_type,
-        mode: metadata.permissions().mode() & 0o7777,
-        links: metadata.nlink() as u32,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
+        file_type: metadata_file_type(metadata),
+        mode,
+        links,
+        uid,
+        gid,
         size: metadata.len(),
-        used: metadata.blocks().saturating_mul(512),
+        used,
         device: None,
-        fs_id: metadata.dev(),
+        fs_id,
         file_id,
-        access_time: metadata_time(metadata.atime(), metadata.atime_nsec()),
-        modify_time: metadata_time(metadata.mtime(), metadata.mtime_nsec()),
-        change_time: metadata_time(metadata.ctime(), metadata.ctime_nsec()),
+        access_time,
+        modify_time,
+        change_time,
     }
 }
 
 fn metadata_to_wcc(metadata: &Metadata) -> WccAttributes {
+    let (_, _, _, _, _, _, _, modify_time, change_time) = metadata_platform_attributes(metadata);
     WccAttributes {
         size: metadata.len(),
-        modify_time: metadata_time(metadata.mtime(), metadata.mtime_nsec()),
-        change_time: metadata_time(metadata.ctime(), metadata.ctime_nsec()),
+        modify_time,
+        change_time,
     }
 }
 
+#[cfg(unix)]
 fn directory_verifier(metadata: &Metadata) -> [u8; 8] {
     let seconds = metadata.mtime() as u64;
     let nanoseconds = metadata.mtime_nsec() as u64;
     (seconds.rotate_left(17) ^ nanoseconds ^ metadata.ino()).to_be_bytes()
 }
 
+#[cfg(windows)]
+fn directory_verifier(metadata: &Metadata) -> [u8; 8] {
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+    (duration.as_secs().rotate_left(17) ^ u64::from(duration.subsec_nanos()) ^ metadata.len()).to_be_bytes()
+}
+
+#[cfg(unix)]
+async fn apply_mode(path: &Path, mode: u32) -> Result<(), NfsError> {
+    let writable_mode = (mode | 0o200) & 0o7777;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(writable_mode))
+        .await
+        .map_err(map_io_error)
+}
+
+#[cfg(windows)]
+async fn apply_mode(path: &Path, mode: u32) -> Result<(), NfsError> {
+    let mut permissions = tokio::fs::metadata(path).await.map_err(map_io_error)?.permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    tokio::fs::set_permissions(path, permissions).await.map_err(map_io_error)
+}
+
 async fn apply_attributes(path: &Path, attributes: &SetAttributes) -> Result<(), NfsError> {
+    validate_attributes(attributes)?;
     if let Some(mode) = attributes.mode {
-        let writable_mode = (mode | 0o200) & 0o7777;
-        tokio::fs::set_permissions(path, Permissions::from_mode(writable_mode))
-            .await
-            .map_err(map_io_error)?;
-    }
-    if attributes.uid.is_some() || attributes.gid.is_some() {
-        debug!("setting uid/gid is not implemented by the mirror example");
+        apply_mode(path, mode).await?;
     }
     if let Some(size) = attributes.size {
         OpenOptions::new()
@@ -738,6 +1214,216 @@ async fn apply_attributes(path: &Path, attributes: &SetAttributes) -> Result<(),
     Ok(())
 }
 
+fn validate_attributes(attributes: &SetAttributes) -> Result<(), NfsError> {
+    if attributes.uid.is_some() || attributes.gid.is_some() {
+        return Err(NfsError::NotSupported);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_windows_component;
+
+    #[test]
+    fn windows_components_reject_aliases_and_path_syntax() {
+        for valid in ["file.txt", "résumé", "COM10", "folder-name"] {
+            assert!(valid_windows_component(valid), "{valid}");
+        }
+        for invalid in [
+            ".",
+            "..",
+            "CON",
+            "con.txt",
+            "LPT1.log",
+            "COM¹.txt",
+            "bad\\name",
+            "bad:name",
+            "trail.",
+            "trail ",
+        ] {
+            assert!(!valid_windows_component(invalid), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_create_ownership_does_not_touch_the_host_namespace() {
+        use nfsserve::vfs::{CreateMode, NfsError, NfsName, SetAttributes, VirtualFileSystem};
+
+        use super::{CreateKind, MirrorFs};
+
+        let root = std::env::temp_dir().join(format!(
+            "nfsserve-create-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fs = MirrorFs::new(root.clone());
+
+        for (name, kind, attributes) in [
+            (
+                "uid-file",
+                CreateKind::File(CreateMode::Unchecked),
+                SetAttributes {
+                    uid: Some(1234),
+                    ..SetAttributes::default()
+                },
+            ),
+            (
+                "gid-directory",
+                CreateKind::Directory,
+                SetAttributes {
+                    gid: Some(1234),
+                    ..SetAttributes::default()
+                },
+            ),
+        ] {
+            let name = NfsName::new(name.as_bytes().to_vec()).unwrap();
+            assert_eq!(fs.create_object(fs.root(), &name, attributes, kind).await, Err(NfsError::NotSupported),);
+            assert!(!root.join(std::str::from_utf8(name.as_bytes()).unwrap()).exists());
+        }
+
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn path_interning_uses_a_reverse_index() {
+        use super::FsMap;
+
+        let mut map = FsMap::new(std::path::PathBuf::from("unused"));
+        for index in 0..4096 {
+            map.intern(vec![std::ffi::OsString::from(format!("entry-{index}"))]).unwrap();
+        }
+        assert_eq!(map.relative_to_id.len(), 4097);
+        assert_eq!(map.intern(vec![std::ffi::OsString::from("entry-2048")]).unwrap(), 2050,);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_is_folded_without_changing_the_host_path() {
+        use nfsserve::vfs::{NfsName, ObjectKey};
+
+        use super::{nfs_name_to_os_string, relative_eq, relative_key, FsMap, GENERATION};
+
+        let mut map = FsMap::new(std::path::PathBuf::from(r"C:\mirror-root"));
+        let original = vec![std::ffi::OsString::from("MiXeD.Txt")];
+        let file_id = map.intern(original.clone()).unwrap();
+        assert_eq!(map.intern(vec![std::ffi::OsString::from("mixed.txt")]).unwrap(), file_id);
+        assert_eq!(
+            map.relative(ObjectKey {
+                file_id,
+                generation: GENERATION,
+            })
+            .unwrap(),
+            original,
+        );
+
+        let name = NfsName::new(b"AnotherMiXeD.Txt".to_vec()).unwrap();
+        assert_eq!(nfs_name_to_os_string(&name).unwrap(), "AnotherMiXeD.Txt");
+        let capital = [std::ffi::OsString::from("Σ.txt")];
+        let normal_sigma = [std::ffi::OsString::from("σ.txt")];
+        let final_sigma = [std::ffi::OsString::from("ς.txt")];
+        assert!(relative_eq(&capital, &normal_sigma));
+        assert_eq!(relative_key(&capital).unwrap(), relative_key(&normal_sigma).unwrap());
+        assert_eq!(map.intern(capital.to_vec()).unwrap(), map.intern(normal_sigma.to_vec()).unwrap());
+
+        // Windows ordinal comparison and invariant mapping both keep final
+        // sigma distinct from the ordinary sigma pair.
+        assert!(!relative_eq(&capital, &final_sigma));
+        assert_ne!(relative_key(&capital).unwrap(), relative_key(&final_sigma).unwrap());
+        assert_ne!(map.intern(capital.to_vec()).unwrap(), map.intern(final_sigma.to_vec()).unwrap());
+
+        map.move_prefix(&[std::ffi::OsString::from("mixed.txt")], &[std::ffi::OsString::from("MIXED.txt")])
+            .unwrap();
+        assert_eq!(
+            map.relative(ObjectKey {
+                file_id,
+                generation: GENERATION,
+            })
+            .unwrap(),
+            vec![std::ffi::OsString::from("MIXED.txt")],
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_case_only_rename_preserves_requested_spelling() {
+        use super::rename_host_path;
+
+        let root = std::env::temp_dir().join(format!(
+            "nfsserve-case-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let from = root.join("MiXeD.txt");
+        let to = root.join("MIXED.txt");
+        std::fs::write(&from, b"case-preserved").unwrap();
+
+        rename_host_path(&from, &to, true).await.unwrap();
+        let name = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().file_name();
+        assert_eq!(name, "MIXED.txt");
+        assert_eq!(std::fs::read(&to).unwrap(), b"case-preserved");
+
+        std::fs::remove_file(&to).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_readlink_accepts_a_preexisting_multicomponent_target() {
+        use nfsserve::vfs::{ExportId, NfsName, Principal, RequestContext, VirtualFileSystem};
+
+        use super::MirrorFs;
+
+        let root = std::env::temp_dir().join(format!(
+            "nfsserve-readlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target_directory = root.join("target-directory");
+        std::fs::create_dir_all(&target_directory).unwrap();
+        std::fs::write(target_directory.join("target.txt"), b"target").unwrap();
+        let link = root.join("link.txt");
+        std::os::windows::fs::symlink_file(r"target-directory\target.txt", &link).unwrap();
+
+        let fs = MirrorFs::new(root.clone());
+        let context = RequestContext {
+            principal: Principal::Anonymous,
+            client_addr: "127.0.0.1:1".parse().unwrap(),
+            export_id: ExportId(1),
+        };
+        let name = NfsName::new(b"link.txt".to_vec()).unwrap();
+        let object = fs.lookup(&context, fs.root(), &name).await.unwrap().object;
+        assert_eq!(fs.readlink(&context, object).await.unwrap(), br"target-directory\target.txt",);
+
+        let renamed_name = NfsName::new(b"LINK.txt".to_vec()).unwrap();
+        fs.rename(&context, fs.root(), &name, fs.root(), &renamed_name).await.unwrap();
+        assert_eq!(fs.readlink(&context, object).await.unwrap(), br"target-directory\target.txt",);
+        assert_eq!(std::fs::read(target_directory.join("target.txt")).unwrap(), b"target");
+        let renamed_link = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_type().unwrap().is_symlink())
+            .unwrap();
+        assert_eq!(renamed_link.file_name(), "LINK.txt");
+
+        std::fs::remove_file(root.join("LINK.txt")).unwrap();
+        std::fs::remove_file(target_directory.join("target.txt")).unwrap();
+        std::fs::remove_dir(target_directory).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+}
+
 fn set_time_to_file_time(time: SetTime) -> filetime::FileTime {
     match time {
         SetTime::ServerTime => filetime::FileTime::now(),
@@ -745,8 +1431,12 @@ fn set_time_to_file_time(time: SetTime) -> filetime::FileTime {
     }
 }
 
+#[cfg(feature = "demo")]
+#[allow(dead_code)]
 const HOST_PORT: u16 = 11111;
 
+#[cfg(feature = "demo")]
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -762,7 +1452,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = NfsServer::builder(MirrorFs::new(root))
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
-    server.serve(listener, std::future::pending()).await?;
+    if let Ok(address) = std::env::var("NFSSERVE_PORTMAPPER") {
+        let portmapper_tcp = TcpListener::bind(address).await?;
+        let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
+        server
+            .serve_with_portmapper(
+                listener,
+                PortmapperSockets::new(portmapper_tcp, portmapper_udp),
+                std::future::pending(),
+            )
+            .await?;
+    } else {
+        server.serve(listener, std::future::pending()).await?;
+    }
     Ok(())
 }
 
