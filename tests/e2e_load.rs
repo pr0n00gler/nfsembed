@@ -3,9 +3,9 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nfsserve::rpc::codec::Encoder;
-use nfsserve::server::{AuthPolicy, PortmapperMode, ServerLimits};
-use nfsserve::vfs::ExportId;
+use nfsserver::rpc::codec::Encoder;
+use nfsserver::server::{AuthPolicy, PortmapperMode, ServerLimits};
+use nfsserver::vfs::ExportId;
 use support::rpc::{mount_root, nfs_args_handle, nfs_payload, start_server_with, RpcClient, NFS_PROGRAM, NFS_VERSION};
 use support::vfs::ConformanceVfs;
 use tokio::sync::Barrier;

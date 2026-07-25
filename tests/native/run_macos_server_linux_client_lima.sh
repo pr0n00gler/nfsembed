@@ -3,7 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 instance=${LIMA_INSTANCE:-linux}
-guest_root=${LIMA_REPOSITORY:-/tmp/nfsserve}
+guest_root=${LIMA_REPOSITORY:-/tmp/nfsserver}
 port=${NFS_PORT:-20491}
 state_dir=
 ready_file=
@@ -39,7 +39,7 @@ wait_ready() {
 run_profile() {
   profile=$1
   client_mode=$2
-  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserve-lima-cross.XXXXXX")
+  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserver-lima-cross.XXXXXX")
   ready_file=$state_dir/ready
   shutdown_file=$state_dir/shutdown
   restart_file=$state_dir/restart

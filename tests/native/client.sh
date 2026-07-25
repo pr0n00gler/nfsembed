@@ -5,8 +5,8 @@ root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 server_host=${1:?usage: client.sh SERVER_HOST SERVER_PORT}
 server_port=${2:?usage: client.sh SERVER_HOST SERVER_PORT}
 profile=${3:-read-write}
-mount_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserve-native-mount.XXXXXX")
-expected_file=$(mktemp "${TMPDIR:-/tmp}/nfsserve-native-expected.XXXXXX")
+mount_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserver-native-mount.XXXXXX")
+expected_file=$(mktemp "${TMPDIR:-/tmp}/nfsserver-native-expected.XXXXXX")
 mounted=0
 
 privileged() {

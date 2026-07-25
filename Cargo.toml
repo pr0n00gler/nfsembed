@@ -1,12 +1,11 @@
 [package]
-name = "nfsserve"
+name = "nfsserver"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.96"
-authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]
 description = "A Rust NFS Server implementation"
-homepage = "https://github.com/pr0n00gler/nfsserve"
-repository = "https://github.com/pr0n00gler/nfsserve"
+homepage = "https://github.com/pr0n00gler/nfsserver"
+repository = "https://github.com/pr0n00gler/nfsserver"
 readme = "README.md"
 keywords = ["nfs"]
 license = "BSD-3-Clause"

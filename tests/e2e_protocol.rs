@@ -2,8 +2,8 @@ mod support;
 
 use std::sync::Arc;
 
-use nfsserve::rpc::codec::{Decoder, Encoder};
-use nfsserve::vfs::{
+use nfsserver::rpc::codec::{Decoder, Encoder};
+use nfsserver::vfs::{
     CreateMode, ExportId, NfsTime, NodeType, Principal, SetTime, WriteResult as VfsWriteResult, WriteStability,
 };
 use support::rpc::{

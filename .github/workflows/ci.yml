@@ -1,4 +1,4 @@
-name: nfsserve CI
+name: nfsserver CI
 
 on:
   push:

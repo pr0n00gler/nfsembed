@@ -3,11 +3,11 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use nfsserve::handles::HandleCodec;
-use nfsserve::nfs3::codec::{truncate_readdir_result, EncodeNfsResult};
-use nfsserve::nfs3::procedures::{NfsArguments, ReadDirEntry, ReadDirEntryExtension, ReadDirResult};
-use nfsserve::rpc::codec::{Decoder, Encoder};
-use nfsserve::vfs::{ExportId, ObjectKey};
+use nfsserver::handles::HandleCodec;
+use nfsserver::nfs3::codec::{truncate_readdir_result, EncodeNfsResult};
+use nfsserver::nfs3::procedures::{NfsArguments, ReadDirEntry, ReadDirEntryExtension, ReadDirResult};
+use nfsserver::rpc::codec::{Decoder, Encoder};
+use nfsserver::vfs::{ExportId, ObjectKey};
 
 fuzz_target!(|data: &[u8]| {
     static HANDLES: OnceLock<HandleCodec> = OnceLock::new();

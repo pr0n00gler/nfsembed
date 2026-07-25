@@ -1,13 +1,14 @@
 Embedded Rust NFSv3 Server
 ==========================
 
-> This project is an independent fork of [huggingface/nfsserve](https://github.com/huggingface/nfsserve), based on upstream commit `c00c3614184bc79010c0aa3b69c2cdde1c5fca77`.
+> This project is an independent fork of Hugging Face's original NFSv3 server,
+> based on upstream commit `c00c3614184bc79010c0aa3b69c2cdde1c5fca77`.
 > 
 > It has intentionally diverged from upstream and is not API-compatible with
 > the original crate. This project is not affiliated with or endorsed by the
 > upstream authors or contributors.
 
-`nfsserve` is an embeddable NFSv3-over-TCP server driven by an
+`nfsserver` is an embeddable NFSv3-over-TCP server driven by an
 application-provided virtual filesystem. The application owns the Tokio
 runtime, listener, process lifecycle, signal handling, and operating-system
 mount execution.
@@ -28,7 +29,7 @@ The minimum supported Rust version is 1.96.
 What changed in the fork
 ========================
 
-The fork is a breaking, production-oriented refactor of the original `nfsserve` crate.
+The fork is a breaking, production-oriented refactor of the upstream crate.
 It preserves the useful protocol definitions and interoperability knowledge,
 but replaces the public server lifecycle, VFS contract, wire codec, transport,
 retransmission handling, file handles, and test strategy. It is an evolution of
@@ -190,7 +191,7 @@ The test suite was expanded from basic behavior checks into release gates:
 Migration checklist
 -------------------
 
-Applications moving from the original `nfsserve` version should:
+Applications moving from the upstream version should:
 
 1. Replace `NFSFileSystem` with `VirtualFileSystem` and use `ObjectKey` rather
    than exposing raw numeric IDs as NFS handles.
@@ -215,7 +216,7 @@ Implement `vfs::VirtualFileSystem`, then construct a server without creating a
 runtime or binding a socket inside the library:
 
 ```rust,ignore
-use nfsserve::{AuthPolicy, NfsServer, ServerLimits};
+use nfsserver::{AuthPolicy, NfsServer, ServerLimits};
 use tokio::net::TcpListener;
 
 let server = NfsServer::builder(vfs)
@@ -246,7 +247,7 @@ for the required privileges and port ownership), then transfers both sockets to
 the same server lifecycle:
 
 ```rust,ignore
-use nfsserve::{NfsServer, PortmapperSockets};
+use nfsserver::{NfsServer, PortmapperSockets};
 use tokio::net::{TcpListener, UdpSocket};
 
 let nfs = TcpListener::bind("0.0.0.0:2049").await?;

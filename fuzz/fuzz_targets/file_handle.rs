@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use nfsserve::handles::HandleCodec;
+use nfsserver::handles::HandleCodec;
 
 fuzz_target!(|data: &[u8]| {
     static CODEC: OnceLock<HandleCodec> = OnceLock::new();

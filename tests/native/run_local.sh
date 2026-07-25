@@ -54,7 +54,7 @@ run_profile() {
   profile=$1
   client_mode=$2
   current_profile=$profile
-  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserve-native-state.XXXXXX")
+  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserver-native-state.XXXXXX")
   ready_file=$state_dir/ready
   shutdown_file=$state_dir/shutdown
   restart_file=$state_dir/restart

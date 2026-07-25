@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use certification_vfs::{CertificationProfile, CertificationVfs};
-use nfsserve::rpc::codec::Decoder;
-use nfsserve::rpc::record::{read_record, write_record_limited, RecordLimits};
-use nfsserve::{AuthPolicy, ExportId, NfsServer, PortmapperSockets, VirtualFileSystem};
+use nfsserver::rpc::codec::Decoder;
+use nfsserver::rpc::record::{read_record, write_record_limited, RecordLimits};
+use nfsserver::{AuthPolicy, ExportId, NfsServer, PortmapperSockets, VirtualFileSystem};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
@@ -166,7 +166,7 @@ fn is_nfs_write(record: &[u8]) -> bool {
     decoder.read_u32().is_ok()
         && decoder.read_u32() == Ok(0)
         && decoder.read_u32() == Ok(2)
-        && decoder.read_u32() == Ok(nfsserve::nfs3::types::PROGRAM)
-        && decoder.read_u32() == Ok(nfsserve::nfs3::types::VERSION)
+        && decoder.read_u32() == Ok(nfsserver::nfs3::types::PROGRAM)
+        && decoder.read_u32() == Ok(nfsserver::nfs3::types::VERSION)
         && decoder.read_u32() == Ok(7)
 }

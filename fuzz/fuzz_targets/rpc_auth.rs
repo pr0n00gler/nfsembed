@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use nfsserve::rpc::auth::decode_principal;
+use nfsserver::rpc::auth::decode_principal;
 
 fuzz_target!(|data: &[u8]| {
     let (flavor, body) = if let Some(prefix) = data.get(..4) {

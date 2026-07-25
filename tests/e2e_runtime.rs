@@ -3,9 +3,9 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nfsserve::rpc::codec::{Decoder, Encoder};
-use nfsserve::server::{AuthPolicy, NfsServer, PortmapperMode, PortmapperSockets, ServerLimits};
-use nfsserve::vfs::ExportId;
+use nfsserver::rpc::codec::{Decoder, Encoder};
+use nfsserver::server::{AuthPolicy, NfsServer, PortmapperMode, PortmapperSockets, ServerLimits};
+use nfsserver::vfs::ExportId;
 use support::rpc::{
     assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
     parse_reply, record_header, rpc_call, start_built_server, start_server, start_server_with, Auth, RpcClient,
@@ -585,14 +585,14 @@ async fn mount_matching_preserves_boundaries_lengths_types_and_backend_errors() 
     let payload = nfs_payload(client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, &file_path.into_bytes()).await);
     assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()), 20);
 
-    vfs.fail("lookup", nfsserve::vfs::NfsError::Access);
+    vfs.fail("lookup", nfsserver::vfs::NfsError::Access);
     let mut denied_path = Encoder::new();
     denied_path.write_opaque(b"/data/file").unwrap();
     let payload = nfs_payload(client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, &denied_path.into_bytes()).await);
     assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()), 13);
     vfs.clear_failure("lookup");
 
-    vfs.fail("lookup", nfsserve::vfs::NfsError::NameTooLong);
+    vfs.fail("lookup", nfsserver::vfs::NfsError::NameTooLong);
     let mut long_name = Encoder::new();
     long_name.write_opaque(b"/data/file").unwrap();
     let payload = nfs_payload(client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, &long_name.into_bytes()).await);
@@ -1117,7 +1117,7 @@ async fn large_read_and_write_records_cross_transport_without_truncation() {
     decoder.finish().unwrap();
     let observed = vfs.last_write().unwrap();
     assert_eq!(observed.offset, 4096);
-    assert_eq!(observed.requested, nfsserve::vfs::WriteStability::FileSync);
+    assert_eq!(observed.requested, nfsserver::vfs::WriteStability::FileSync);
     assert_eq!(observed.data, write_data);
 
     server.shutdown().await;
