@@ -1,6 +1,12 @@
 Embedded Rust NFSv3 Server
 ==========================
 
+> This project is an independent fork of `[huggingface/nfsserve](https://github.com/huggingface/nfsserve)`, based on upstream commit `c00c3614184bc79010c0aa3b69c2cdde1c5fca77`.
+> 
+> It has intentionally diverged from upstream and is not API-compatible with
+> the original crate. This project is not affiliated with or endorsed by the
+> upstream authors or contributors.
+
 `nfsserve` is an embeddable NFSv3-over-TCP server driven by an
 application-provided virtual filesystem. The application owns the Tokio
 runtime, listener, process lifecycle, signal handling, and operating-system
@@ -18,8 +24,6 @@ application supplies a TCP listener and UDP socket on port 111 in addition to
 its NFS TCP listener.
 
 The minimum supported Rust version is 1.96.
-
-> Note: this is a fork of https://github.com/huggingface/nfsserve project with more tests + a lot of improvements.
 
 What changed in the fork
 ========================
