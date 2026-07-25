@@ -1,8 +1,7 @@
 Embedded Rust NFSv3 Server
 ==========================
 
-> This project is an independent fork of Hugging Face's original NFSv3 server,
-> based on upstream commit `c00c3614184bc79010c0aa3b69c2cdde1c5fca77`.
+> This project is an independent fork of [huggingface/nfsserve](https://github.com/huggingface/nfsserve), based on upstream commit `c00c3614184bc79010c0aa3b69c2cdde1c5fca77`.
 > 
 > It has intentionally diverged from upstream and is not API-compatible with
 > the original crate. This project is not affiliated with or endorsed by the
