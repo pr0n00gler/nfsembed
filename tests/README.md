@@ -8,7 +8,7 @@ and communicate with the server over real TCP RPC record streams.
 | --- | --- |
 | `e2e_protocol.rs` | Exact successful wire results for all 22 NFSv3 procedures, all MOUNTv3 procedures, AUTH_SYS context propagation, WCC, create modes, durability, cookies, and pagination |
 | `e2e_errors.rs` | Every NFSv3 result-union failure shape, all-procedure truncation and trailing-field rejection, invalid discriminants, field limits, RPC mismatch ranges, and authentication policies |
-| `e2e_runtime.rs` | Replay hit/wait/lost-reply/XID-generation/TTL/count/byte-budget behavior, authenticated handle isolation, multiple exports, portmapper, transport-aware transfer limits, aggregate request/reply byte budgets, execution and socket-progress timeouts, slow-reader eviction, concurrency, graceful lifecycle, reconnects, read-only and case policies |
+| `e2e_runtime.rs` | Replay hit/wait/lost-reply/XID-generation/TTL/count/byte-budget behavior, authenticated handle isolation, multiple exports, inline and standalone TCP/UDP portmapper including oversized-datagram recovery, transport-aware transfer limits, aggregate request/reply byte budgets, execution and socket-progress timeouts, slow-reader eviction, concurrency, graceful lifecycle, reconnects, read-only and case policies |
 | `e2e_adversarial.rs` | Fragmentation corpus, authentication prefix corpus, WRITE truncation and length corpus, READDIR/READDIRPLUS size sweep, and per-byte file-handle forgery corpus |
 | `e2e_observability.rs` | Stable tracing fields and events plus negative checks for file-content and AUTH_SYS machine-name leakage |
 | `e2e_load.rs` | Sustained multi-connection request/mutation load with concurrency, completion-time, operation-count, and Linux RSS-growth thresholds |

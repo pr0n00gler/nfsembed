@@ -2,6 +2,7 @@
 name = "nfsserve"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.96"
 authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]
 description = "A Rust NFS Server implementation"
 homepage = "https://github.com/huggingface/nfsserve"
@@ -31,6 +32,9 @@ hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"
 thiserror = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 
 # demo
 tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }

@@ -7,8 +7,8 @@ use nfsserve::vfs::{
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
-use nfsserve::{AuthPolicy, NfsServer};
-use tokio::net::TcpListener;
+use nfsserve::{AuthPolicy, NfsServer, PortmapperSockets};
+use tokio::net::{TcpListener, UdpSocket};
 
 const ROOT_ID: u64 = 1;
 const GENERATION: u64 = 1;
@@ -464,7 +464,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = NfsServer::builder(DemoFs::default())
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
-    server.serve(listener, std::future::pending()).await?;
+    if let Ok(address) = std::env::var("NFSSERVE_PORTMAPPER") {
+        let portmapper_tcp = TcpListener::bind(address).await?;
+        let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
+        server
+            .serve_with_portmapper(
+                listener,
+                PortmapperSockets::new(portmapper_tcp, portmapper_udp),
+                std::future::pending(),
+            )
+            .await?;
+    } else {
+        server.serve(listener, std::future::pending()).await?;
+    }
     Ok(())
 }
 

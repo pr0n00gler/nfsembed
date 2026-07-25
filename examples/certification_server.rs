@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 #[path = "../tests/support/certification_vfs.rs"]
 mod certification_vfs;
+#[path = "mirrorfs.rs"]
+mod mirrorfs_backend;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -11,8 +13,8 @@ use std::time::Duration;
 use certification_vfs::{CertificationProfile, CertificationVfs};
 use nfsserve::rpc::codec::Decoder;
 use nfsserve::rpc::record::{read_record, write_record_limited, RecordLimits};
-use nfsserve::{AuthPolicy, ExportId, NfsServer};
-use tokio::net::{TcpListener, TcpStream};
+use nfsserve::{AuthPolicy, ExportId, NfsServer, PortmapperSockets, VirtualFileSystem};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 #[tokio::main(flavor = "current_thread")]
@@ -21,21 +23,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = arguments.next().unwrap_or_else(|| "127.0.0.1:0".to_owned());
     let ready_file = PathBuf::from(arguments.next().ok_or("missing ready-file argument")?);
     let shutdown_file = PathBuf::from(arguments.next().ok_or("missing shutdown-file argument")?);
-    let (profile, lose_first_write_reply) = match arguments.next().as_deref() {
-        None | Some("read-write") => (CertificationProfile::ReadWrite, false),
-        Some("lost-reply") => (CertificationProfile::ReadWrite, true),
-        Some("read-only") => (CertificationProfile::ReadOnly, false),
-        Some("case-insensitive") => (CertificationProfile::CaseInsensitive, false),
-        Some(_) => return Err("unknown certification profile".into()),
-    };
+    let profile = arguments.next().unwrap_or_else(|| "read-write".to_owned());
     let restart_file = arguments.next().map(PathBuf::from);
+    let portmapper_listen = arguments.next();
+    let backend_root = arguments.next().map(PathBuf::from);
 
-    let vfs = Arc::new(CertificationVfs::new(ExportId(1), profile));
+    let (vfs, lose_first_write_reply): (Arc<dyn VirtualFileSystem>, bool) = match profile.as_str() {
+        "read-write" => (Arc::new(CertificationVfs::new(ExportId(1), CertificationProfile::ReadWrite)), false),
+        "lost-reply" => (Arc::new(CertificationVfs::new(ExportId(1), CertificationProfile::ReadWrite)), true),
+        "read-only" => (Arc::new(CertificationVfs::new(ExportId(1), CertificationProfile::ReadOnly)), false),
+        "case-insensitive" => {
+            (Arc::new(CertificationVfs::new(ExportId(1), CertificationProfile::CaseInsensitive)), false)
+        },
+        "mirror" => (
+            Arc::new(mirrorfs_backend::MirrorFs::new(backend_root.ok_or("mirror profile requires a backend root")?)),
+            false,
+        ),
+        _ => return Err("unknown certification profile".into()),
+    };
     let server = NfsServer::builder_arc(vfs)
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
     if lose_first_write_reply {
-        return serve_with_lost_write_reply(&server, &listen, &ready_file, &shutdown_file).await;
+        return serve_with_lost_write_reply(
+            &server,
+            &listen,
+            &ready_file,
+            &shutdown_file,
+            portmapper_listen.as_deref(),
+        )
+        .await;
     }
     let mut bind_address = listen;
 
@@ -43,17 +60,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&bind_address).await?;
         let address = listener.local_addr()?;
         bind_address = address.to_string();
+        let handle = if let Some(portmapper_listen) = portmapper_listen.as_deref() {
+            server
+                .start_with_portmapper(listener, bind_portmapper(portmapper_listen, address.port()).await?)
+                .await?
+        } else {
+            server.start(listener).await?
+        };
         std::fs::write(&ready_file, address.port().to_string())?;
-
-        let watched_shutdown = shutdown_file.clone();
-        let watched_restart = restart_file.clone();
-        server
-            .serve(listener, async move {
-                while !watched_shutdown.exists() && !watched_restart.as_ref().is_some_and(|restart| restart.exists()) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await?;
+        while !shutdown_file.exists() && !restart_file.as_ref().is_some_and(|restart| restart.exists()) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.shutdown().await?;
+        handle.wait().await?;
         if shutdown_file.exists() || restart_file.is_none() {
             break;
         }
@@ -69,12 +88,20 @@ async fn serve_with_lost_write_reply(
     listen: &str,
     ready_file: &Path,
     shutdown_file: &Path,
+    portmapper_listen: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
     let upstream_address = upstream_listener.local_addr()?;
-    let server_handle = server.start(upstream_listener).await?;
     let public_listener = TcpListener::bind(listen).await?;
-    std::fs::write(ready_file, public_listener.local_addr()?.port().to_string())?;
+    let public_port = public_listener.local_addr()?.port();
+    let server_handle = if let Some(portmapper_listen) = portmapper_listen {
+        server
+            .start_with_portmapper(upstream_listener, bind_portmapper(portmapper_listen, public_port).await?)
+            .await?
+    } else {
+        server.start(upstream_listener).await?
+    };
+    std::fs::write(ready_file, public_port.to_string())?;
     let lose_reply = Arc::new(AtomicBool::new(true));
     let mut proxies = JoinSet::new();
 
@@ -101,6 +128,12 @@ async fn serve_with_lost_write_reply(
     server_handle.shutdown().await?;
     server_handle.wait().await?;
     Ok(())
+}
+
+async fn bind_portmapper(address: &str, advertised_port: u16) -> Result<PortmapperSockets, std::io::Error> {
+    let tcp = TcpListener::bind(address).await?;
+    let udp = UdpSocket::bind(tcp.local_addr()?).await?;
+    Ok(PortmapperSockets::new(tcp, udp).advertised_ports(advertised_port, advertised_port))
 }
 
 async fn proxy_connection(

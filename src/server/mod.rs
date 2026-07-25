@@ -3,6 +3,7 @@ mod config;
 mod connection;
 mod handle;
 mod limits;
+mod portmapper;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -13,6 +14,7 @@ pub use config::{AuthPolicy, PortmapperMode};
 use connection::{serve_connection, ConnectionState};
 pub use handle::{MountInfo, ServerHandle};
 pub use limits::ServerLimits;
+pub use portmapper::PortmapperSockets;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::{JoinError, JoinSet};
@@ -123,20 +125,65 @@ impl NfsServer {
     }
 
     pub async fn start(&self, listener: TcpListener) -> Result<ServerHandle, ServerError> {
+        self.start_inner(listener, None).await
+    }
+
+    /// Starts NFS/MOUNT together with a standalone TCP+UDP portmapper.
+    pub async fn start_with_portmapper(
+        &self,
+        listener: TcpListener,
+        portmapper: PortmapperSockets,
+    ) -> Result<ServerHandle, ServerError> {
+        self.start_inner(listener, Some(portmapper)).await
+    }
+
+    async fn start_inner(
+        &self,
+        listener: TcpListener,
+        portmapper: Option<PortmapperSockets>,
+    ) -> Result<ServerHandle, ServerError> {
         let local_addr = listener.local_addr()?;
         let mount_infos = self.mount_infos(local_addr);
+        let portmapper = portmapper.map(|sockets| sockets.prepare(local_addr.port())).transpose()?;
+        let portmapper_addr = portmapper.as_ref().map(|portmapper| portmapper.local_addr);
         let (shutdown, receive) = watch::channel(false);
         let (state, executions) = self.connection_state(local_addr.port())?;
         let deadline = self.limits.graceful_shutdown_timeout;
-        let task = tokio::spawn(async move { run(listener, receive, state, executions, deadline).await });
-        Ok(ServerHandle::new(mount_infos, shutdown, task))
+        let task = tokio::spawn(async move { run(listener, portmapper, receive, state, executions, deadline).await });
+        Ok(ServerHandle::new(mount_infos, portmapper_addr, shutdown, task))
     }
 
     pub async fn serve<F>(&self, listener: TcpListener, shutdown_signal: F) -> Result<(), ServerError>
     where
         F: Future<Output = ()> + Send,
     {
+        self.serve_inner(listener, None, shutdown_signal).await
+    }
+
+    /// Serves NFS/MOUNT together with a standalone TCP+UDP portmapper.
+    pub async fn serve_with_portmapper<F>(
+        &self,
+        listener: TcpListener,
+        portmapper: PortmapperSockets,
+        shutdown_signal: F,
+    ) -> Result<(), ServerError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        self.serve_inner(listener, Some(portmapper), shutdown_signal).await
+    }
+
+    async fn serve_inner<F>(
+        &self,
+        listener: TcpListener,
+        portmapper: Option<PortmapperSockets>,
+        shutdown_signal: F,
+    ) -> Result<(), ServerError>
+    where
+        F: Future<Output = ()> + Send,
+    {
         let local_addr = listener.local_addr()?;
+        let portmapper = portmapper.map(|sockets| sockets.prepare(local_addr.port())).transpose()?;
         let (shutdown, receive) = watch::channel(false);
         let signal_task = async move {
             shutdown_signal.await;
@@ -144,7 +191,7 @@ impl NfsServer {
         };
         let (state, executions) = self.connection_state(local_addr.port())?;
         tokio::pin!(signal_task);
-        let server = run(listener, receive, state, executions, self.limits.graceful_shutdown_timeout);
+        let server = run(listener, portmapper, receive, state, executions, self.limits.graceful_shutdown_timeout);
         tokio::pin!(server);
         tokio::select! {
             result = &mut server => result,
@@ -193,6 +240,7 @@ impl NfsServer {
 
 async fn run(
     listener: TcpListener,
+    prepared_portmapper: Option<portmapper::PreparedPortmapper>,
     mut shutdown: watch::Receiver<bool>,
     state: Arc<ConnectionState>,
     executions: Arc<ExecutionTracker>,
@@ -200,6 +248,15 @@ async fn run(
 ) -> Result<(), ServerError> {
     let connections = Arc::new(Semaphore::new(state.limits.max_connections));
     let mut tasks = JoinSet::new();
+    let mut services = JoinSet::new();
+    if let Some(portmapper) = prepared_portmapper {
+        services.spawn(portmapper::run_portmapper(
+            portmapper,
+            shutdown.clone(),
+            connections.clone(),
+            state.limits.clone(),
+        ));
+    }
     loop {
         while let Some(result) = tasks.try_join_next() {
             if let Err(error) = result {
@@ -239,10 +296,18 @@ async fn run(
                     tracing::warn!(error = %error, "connection task failed");
                 }
             }
+            Some(result) = services.join_next(), if !services.is_empty() => {
+                let result = result.map_err(ServerError::Task)?;
+                if *shutdown.borrow() {
+                    break;
+                }
+                return result;
+            }
         }
     }
     if timeout(graceful_deadline, async {
         while tasks.join_next().await.is_some() {}
+        while services.join_next().await.is_some() {}
         executions.wait().await;
     })
     .await
@@ -250,6 +315,8 @@ async fn run(
     {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        services.abort_all();
+        while services.join_next().await.is_some() {}
         executions.abort_all().await;
         executions.wait().await;
     }

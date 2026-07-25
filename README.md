@@ -6,11 +6,18 @@ application-provided virtual filesystem. The application owns the Tokio
 runtime, listener, process lifecycle, signal handling, and operating-system
 mount execution.
 
-The production target is native Linux and macOS NFSv3 clients using:
+The production targets are native Linux, macOS, and Microsoft Windows Client
+for NFS. Linux and macOS normally use explicit service ports:
 
 ```text
 vers=3,tcp,port=<port>,mountport=<port>
 ```
+
+Windows discovers NFSv3 and MOUNTv3 through portmapper v2, so the embedding
+application supplies a TCP listener and UDP socket on port 111 in addition to
+its NFS TCP listener.
+
+The minimum supported Rust version is 1.96.
 
 > Note: this is a fork of https://github.com/huggingface/nfsserve project with more tests + a lot of improvements.
 
@@ -169,9 +176,9 @@ The test suite was expanded from basic behavior checks into release gates:
   readers, connection churn, and bounded-memory/concurrency behavior;
 * seven cargo-fuzz targets exercise RPC/XDR, authentication, record marking,
   handles, WRITE, READDIR/READDIRPLUS, and replay transitions;
-* Linux and macOS kernel clients run read-write, restart, lost-reply, read-only,
-  and case-policy profiles in same-host CI; cross-host macOS/Linux helper scripts
-  are also available for local certification;
+* Linux, macOS, and Windows kernel clients run read-write, restart, lost-reply,
+  read-only, and case-policy profiles in native CI; cross-host macOS/Linux
+  helper scripts are also available for local certification;
 * CI checks formatting, strict Clippy, tests with default and all features,
   rustdoc warnings, crate packaging, fuzz smoke sessions, and native
   interoperability.
@@ -226,6 +233,44 @@ handle.wait().await?;
 Applications that want ownership of the top-level server future can use
 `server.serve(listener, shutdown_signal).await` instead.
 
+Windows Client for NFS
+----------------------
+
+Windows requires portmapper v2 discovery and may query it over either TCP or
+UDP. The application remains responsible for binding port 111 (and therefore
+for the required privileges and port ownership), then transfers both sockets to
+the same server lifecycle:
+
+```rust,ignore
+use nfsserve::{NfsServer, PortmapperSockets};
+use tokio::net::{TcpListener, UdpSocket};
+
+let nfs = TcpListener::bind("0.0.0.0:2049").await?;
+let portmapper_tcp = TcpListener::bind("0.0.0.0:111").await?;
+let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
+let sockets = PortmapperSockets::new(portmapper_tcp, portmapper_udp);
+
+let handle = server.start_with_portmapper(nfs, sockets).await?;
+assert_eq!(handle.portmapper_addr(), Some("0.0.0.0:111".parse()?));
+```
+
+The standalone endpoint implements only portmapper v2 `NULL` and `GETPORT`.
+It advertises NFSv3 and MOUNTv3 over TCP and returns zero for every unsupported
+program, version, or transport. `advertised_ports` can point discovery at a TCP
+proxy. Shutdown, fatal errors, task limits, and socket release are shared with
+the NFS server handle.
+
+Microsoft Client for NFS must be configured to use TCP (for example,
+`nfsadmin client config protocol=TCP`) because NFS-over-UDP remains outside the
+crate's scope. The native test runner verifies this setting before mounting.
+
+The Windows host-filesystem demo uses native NTFS semantics without metadata
+sidecars: server-owned NFS file IDs, zero UID/GID, approximate POSIX modes from
+the read-only flag, native timestamps, case-insensitive identity with preserved
+path spelling, and strict UTF-8 Win32-safe names. It reports symlink creation as
+unsupported on Windows. These are example-backend policies; production VFS
+implementations define their own mappings.
+
 The VFS receives a `RequestContext` containing the authenticated principal,
 client address, and export ID. Object keys are wrapped in server-instance and
 export-scoped authenticated file handles; backends never parse raw NFS handles.
@@ -237,7 +282,8 @@ Scope
 =====
 
 The crate implements NFSv3 and MOUNTv3 over TCP. Optional minimal portmapper
-support is disabled by default. NFSv4, UDP, NLM, ACL side protocols,
+v2 discovery is available on the NFS listener or on caller-owned TCP and UDP
+sockets. NFSv4, NFS-over-UDP, NLM, ACL side protocols,
 RPCSEC_GSS, mount execution, privilege elevation, and process lifecycle are
 outside its scope. Backend operations that are unavailable return the NFS-level
 `NFS3ERR_NOTSUPP` result.
@@ -255,7 +301,7 @@ cargo-fuzz smoke sessions. Run the non-privileged repository gate with:
 ```
 
 See [`tests/README.md`](tests/README.md) for the coverage matrix and the
-network-disabled Linux container command. Privileged Linux/macOS native-client
+network-disabled Linux container command. Privileged Linux/macOS/Windows native-client
 runners and local cross-host helper scripts live under
 [`tests/native`](tests/native). Their persistent certification filesystem
 verifies mutation state, pagination, reconnect, restart, concurrency, read-only
@@ -334,6 +380,12 @@ listener. `GETPORT` reports that listener's port for supported NFSv3 or MOUNTv3
 TCP queries and zero for unsupported combinations. It is disabled by default;
 Linux and macOS clients can instead use explicit `port` and `mountport` mount
 options.
+
+For Microsoft Client for NFS, use `PortmapperSockets` with
+`start_with_portmapper` or `serve_with_portmapper`. This exposes the same
+minimal service on a caller-bound TCP/UDP address (normally port 111), which
+allows the Windows client to discover the NFS and MOUNT TCP ports without
+changing the crate's NFS-over-TCP scope.
 
 
 NFS Basics

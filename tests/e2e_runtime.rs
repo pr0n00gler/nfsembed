@@ -4,16 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nfsserve::rpc::codec::{Decoder, Encoder};
-use nfsserve::server::{AuthPolicy, NfsServer, PortmapperMode, ServerLimits};
+use nfsserve::server::{AuthPolicy, NfsServer, PortmapperMode, PortmapperSockets, ServerLimits};
 use nfsserve::vfs::ExportId;
 use support::rpc::{
     assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
-    record_header, start_built_server, start_server, start_server_with, Auth, RpcClient, RpcOutcome, MOUNT_PROGRAM,
-    MOUNT_VERSION, NFS_PROGRAM, NFS_VERSION, PORTMAP_PROGRAM, PORTMAP_VERSION,
+    parse_reply, record_header, rpc_call, start_built_server, start_server, start_server_with, Auth, RpcClient,
+    RpcOutcome, MOUNT_PROGRAM, MOUNT_VERSION, NFS_PROGRAM, NFS_VERSION, PORTMAP_PROGRAM, PORTMAP_VERSION,
 };
 use support::vfs::ConformanceVfs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 
 async fn lookup_handle(client: &mut RpcClient, root: &[u8], name: &[u8]) -> Vec<u8> {
@@ -161,6 +161,109 @@ async fn optional_portmapper_only_returns_supported_tcp_mappings() {
     }
 
     enabled.shutdown().await;
+}
+
+#[tokio::test]
+async fn standalone_portmapper_serves_tcp_and_udp_and_shares_server_lifecycle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nfs_addr = listener.local_addr().unwrap();
+    let portmapper_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let portmapper_addr = portmapper_tcp.local_addr().unwrap();
+    let portmapper_udp = UdpSocket::bind(portmapper_addr).await.unwrap();
+    let server = NfsServer::builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
+    let handle = server
+        .start_with_portmapper(
+            listener,
+            PortmapperSockets::new(portmapper_tcp, portmapper_udp).advertised_ports(40_049, 40_048),
+        )
+        .await
+        .unwrap();
+    assert_eq!(handle.portmapper_addr(), Some(portmapper_addr));
+
+    let mut tcp = RpcClient::connect(portmapper_addr).await;
+    tcp.set_auth(Auth::None);
+    for (program, version, protocol, expected) in [
+        (NFS_PROGRAM, NFS_VERSION, 6, 40_049),
+        (MOUNT_PROGRAM, MOUNT_VERSION, 6, 40_048),
+        (NFS_PROGRAM, NFS_VERSION, 17, 0),
+        (NFS_PROGRAM, 2, 6, 0),
+    ] {
+        let (status, payload) = tcp
+            .call(PORTMAP_PROGRAM, PORTMAP_VERSION, 3, &portmap_arguments(program, version, protocol))
+            .await
+            .accepted();
+        assert_eq!(status, 0);
+        assert_eq!(u32::from_be_bytes(payload.try_into().unwrap()), expected);
+    }
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.send_to(&vec![0xa5; 8192], portmapper_addr).await.unwrap();
+    let abandoned = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let abandoned_request = rpc_call(
+        70,
+        2,
+        PORTMAP_PROGRAM,
+        PORTMAP_VERSION,
+        3,
+        &portmap_arguments(NFS_PROGRAM, NFS_VERSION, 6),
+        &Auth::None,
+    );
+    abandoned.send_to(&abandoned_request, portmapper_addr).await.unwrap();
+    drop(abandoned);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let request = rpc_call(
+        71,
+        2,
+        PORTMAP_PROGRAM,
+        PORTMAP_VERSION,
+        3,
+        &portmap_arguments(NFS_PROGRAM, NFS_VERSION, 6),
+        &Auth::None,
+    );
+    udp.send_to(&request, portmapper_addr).await.unwrap();
+    let mut reply = [0u8; 4096];
+    let (length, source) = tokio::time::timeout(Duration::from_secs(1), udp.recv_from(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source, portmapper_addr);
+    let RpcOutcome::Accepted { xid, status, payload } = parse_reply(&reply[..length]) else {
+        panic!("portmapper returned a denied UDP reply");
+    };
+    assert_eq!((xid, status), (71, 0));
+    assert_eq!(u32::from_be_bytes(payload.try_into().unwrap()), 40_049);
+
+    // Neither malformed traffic nor an unreachable UDP peer may terminate the
+    // shared NFS lifecycle.
+    let mut nfs = RpcClient::connect(nfs_addr).await;
+    assert!(!mount_root(&mut nfs, b"/").await.is_empty());
+    handle.shutdown().await.unwrap();
+    handle.wait().await.unwrap();
+
+    TcpListener::bind(portmapper_addr).await.unwrap();
+    UdpSocket::bind(portmapper_addr).await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_portmapper_rejects_mismatched_socket_addresses() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let portmapper_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut same_port_sockets = Vec::new();
+    let portmapper_udp = loop {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if socket.local_addr().unwrap() != portmapper_tcp.local_addr().unwrap() {
+            break socket;
+        }
+        // Keep the colliding UDP port occupied so the next ephemeral bind
+        // must select another numeric port.
+        same_port_sockets.push(socket);
+    };
+    assert_ne!(portmapper_tcp.local_addr().unwrap(), portmapper_udp.local_addr().unwrap());
+    let server = NfsServer::builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
+    assert!(server
+        .start_with_portmapper(listener, PortmapperSockets::new(portmapper_tcp, portmapper_udp))
+        .await
+        .is_err());
 }
 
 #[tokio::test]

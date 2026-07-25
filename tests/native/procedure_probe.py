@@ -178,6 +178,11 @@ def main():
             raise RuntimeError(f"MOUNT returned status {status}")
         root, _offset = read_opaque(mount_reply, offset)
 
+        wrong_case = client.call(NFS_PROGRAM, NFS_VERSION, 3, directory_operation(root, b"FiLe"))
+        wrong_case_status, _offset = read_u32(wrong_case, 0)
+        if wrong_case_status != 2:
+            raise RuntimeError(f"case-sensitive LOOKUP returned status {wrong_case_status}, expected 2")
+
         def nfs(procedure, arguments=b""):
             payload = client.call(NFS_PROGRAM, NFS_VERSION, procedure, arguments)
             if procedure != 0 and len(payload) < 4:
