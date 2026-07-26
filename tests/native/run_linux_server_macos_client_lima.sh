@@ -3,7 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 instance=${LIMA_INSTANCE:-linux}
-guest_root=${LIMA_REPOSITORY:-/tmp/nfsserver}
+guest_root=${LIMA_REPOSITORY:-/tmp/nfsembed}
 port=${NFS_PORT:-20490}
 state=
 
@@ -58,7 +58,7 @@ stop_server() {
 run_profile() {
   profile=$1
   client_mode=$2
-  state="/tmp/nfsserver-linux-server-$profile"
+  state="/tmp/nfsembed-linux-server-$profile"
   limactl shell "$instance" -- sh -lc "rm -rf '$state'; mkdir -p '$state'; nohup sh '$guest_root/tests/native/certification_server_process.sh' '$guest_root' '0.0.0.0:$port' '$state' '$profile' '$state/restart' >'$state/server.log' 2>&1 </dev/null & echo \$! >'$state/pid'"
   wait_ready
 

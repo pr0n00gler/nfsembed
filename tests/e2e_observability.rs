@@ -3,8 +3,8 @@ mod support;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use nfsserver::rpc::codec::Encoder;
-use nfsserver::vfs::ExportId;
+use nfsembed::rpc::codec::Encoder;
+use nfsembed::vfs::ExportId;
 use support::rpc::{
     mount_root, nfs_args_directory, nfs_args_handle, start_server, RpcClient, NFS_PROGRAM, NFS_VERSION,
 };
@@ -61,7 +61,7 @@ async fn tracing_contains_stable_operational_fields_without_sensitive_payloads()
         .call(NFS_PROGRAM, NFS_VERSION, 3, &nfs_args_directory(&root, b"file"))
         .await;
     let payload = support::rpc::nfs_payload(lookup);
-    let mut decoder = nfsserver::rpc::codec::Decoder::new(&payload);
+    let mut decoder = nfsembed::rpc::codec::Decoder::new(&payload);
     assert_eq!(decoder.read_u32().unwrap(), 0);
     let file = decoder.read_opaque("file handle", 64).unwrap();
 

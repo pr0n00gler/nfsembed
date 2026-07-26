@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserver::vfs::{
+use nfsembed::vfs::{
     CreateMode, CreatedObject, DirectoryEntry, FileAttributes, FileType, FsInfo, FsStat, MutationResult, NfsError,
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
 #[cfg(feature = "demo")]
-use nfsserver::{AuthPolicy, NfsServer, PortmapperSockets};
+use nfsembed::{AuthPolicy, NfsServer, PortmapperSockets};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[cfg(feature = "demo")]
@@ -1248,12 +1248,12 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_create_ownership_does_not_touch_the_host_namespace() {
-        use nfsserver::vfs::{CreateMode, NfsError, NfsName, SetAttributes, VirtualFileSystem};
+        use nfsembed::vfs::{CreateMode, NfsError, NfsName, SetAttributes, VirtualFileSystem};
 
         use super::{CreateKind, MirrorFs};
 
         let root = std::env::temp_dir().join(format!(
-            "nfsserver-create-preflight-{}-{}",
+            "nfsembed-create-preflight-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1304,7 +1304,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_identity_is_folded_without_changing_the_host_path() {
-        use nfsserver::vfs::{NfsName, ObjectKey};
+        use nfsembed::vfs::{NfsName, ObjectKey};
 
         use super::{nfs_name_to_os_string, relative_eq, relative_key, FsMap, GENERATION};
 
@@ -1354,7 +1354,7 @@ mod tests {
         use super::rename_host_path;
 
         let root = std::env::temp_dir().join(format!(
-            "nfsserver-case-rename-{}-{}",
+            "nfsembed-case-rename-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1378,12 +1378,12 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_readlink_accepts_a_preexisting_multicomponent_target() {
-        use nfsserver::vfs::{ExportId, NfsName, Principal, RequestContext, VirtualFileSystem};
+        use nfsembed::vfs::{ExportId, NfsName, Principal, RequestContext, VirtualFileSystem};
 
         use super::MirrorFs;
 
         let root = std::env::temp_dir().join(format!(
-            "nfsserver-readlink-{}-{}",
+            "nfsembed-readlink-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1452,7 +1452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = NfsServer::builder(MirrorFs::new(root))
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
-    if let Ok(address) = std::env::var("NFSSERVER_PORTMAPPER") {
+    if let Ok(address) = std::env::var("NFSEMBED_PORTMAPPER") {
         let portmapper_tcp = TcpListener::bind(address).await?;
         let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
         server

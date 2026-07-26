@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use nfsserver::rpc::record::{read_record, RecordLimits};
+use nfsembed::rpc::record::{read_record, RecordLimits};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Builder, Runtime};
 

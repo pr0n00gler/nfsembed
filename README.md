@@ -7,7 +7,7 @@ Embedded Rust NFSv3 Server
 > the original crate. This project is not affiliated with or endorsed by the
 > upstream authors or contributors.
 
-`nfsserver` is an embeddable NFSv3-over-TCP server driven by an
+`nfsembed` is an embeddable NFSv3-over-TCP server driven by an
 application-provided virtual filesystem. The application owns the Tokio
 runtime, listener, process lifecycle, signal handling, and operating-system
 mount execution.
@@ -215,7 +215,7 @@ Implement `vfs::VirtualFileSystem`, then construct a server without creating a
 runtime or binding a socket inside the library:
 
 ```rust,ignore
-use nfsserver::{AuthPolicy, NfsServer, ServerLimits};
+use nfsembed::{AuthPolicy, NfsServer, ServerLimits};
 use tokio::net::TcpListener;
 
 let server = NfsServer::builder(vfs)
@@ -246,7 +246,7 @@ for the required privileges and port ownership), then transfers both sockets to
 the same server lifecycle:
 
 ```rust,ignore
-use nfsserver::{NfsServer, PortmapperSockets};
+use nfsembed::{NfsServer, PortmapperSockets};
 use tokio::net::{TcpListener, UdpSocket};
 
 let nfs = TcpListener::bind("0.0.0.0:2049").await?;

@@ -1,4 +1,4 @@
-name: nfsserver CI
+name: nfsembed CI
 
 on:
   push:

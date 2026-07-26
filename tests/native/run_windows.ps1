@@ -95,7 +95,7 @@ function Ensure-TcpNfsClient {
 }
 
 function Run-Profile([string]$Profile, [string]$ClientProfile) {
-    $state = Join-Path $env:TEMP ("nfsserver-windows-" + [Guid]::NewGuid().ToString("N"))
+    $state = Join-Path $env:TEMP ("nfsembed-windows-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $state | Out-Null
     $ready = Join-Path $state "ready"
     $shutdown = Join-Path $state "shutdown"

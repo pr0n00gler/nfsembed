@@ -2,9 +2,9 @@ mod support;
 
 use std::sync::Arc;
 
-use nfsserver::rpc::codec::{Decoder, Encoder};
-use nfsserver::server::{AuthPolicy, PortmapperMode, ServerLimits};
-use nfsserver::vfs::{ExportId, NfsError, Principal};
+use nfsembed::rpc::codec::{Decoder, Encoder};
+use nfsembed::server::{AuthPolicy, PortmapperMode, ServerLimits};
+use nfsembed::vfs::{ExportId, NfsError, Principal};
 use support::rpc::{
     assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
     start_server, start_server_with, Auth, RpcClient, RpcOutcome, MOUNT_PROGRAM, NFS_PROGRAM, NFS_VERSION,

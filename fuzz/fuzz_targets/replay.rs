@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use nfsserver::replay::{ReplayCache, ReplayDecision, ReplayKey, RequestFingerprint};
-use nfsserver::vfs::ExportId;
+use nfsembed::replay::{ReplayCache, ReplayDecision, ReplayKey, RequestFingerprint};
+use nfsembed::vfs::ExportId;
 use tokio::runtime::{Builder, Runtime};
 
 fuzz_target!(|data: &[u8]| {

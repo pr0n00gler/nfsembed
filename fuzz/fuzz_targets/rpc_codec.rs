@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use nfsserver::rpc::codec::Decoder;
+use nfsembed::rpc::codec::Decoder;
 
 fuzz_target!(|data: &[u8]| {
     let limit = data.first().copied().map_or(0, usize::from);

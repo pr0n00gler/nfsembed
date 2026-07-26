@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 #[cfg(test)]
-use nfsserver::vfs::Principal;
-use nfsserver::vfs::{
+use nfsembed::vfs::Principal;
+use nfsembed::vfs::{
     CreateMode, CreatedObject, DeviceNumber, DirectoryEntry, ExportId, FileAttributes, FileType, FsInfo, FsStat,
     MutationResult, NfsError, NfsName, NfsTime, NodeType, ObjectKey, PathConf, ReadDirectoryPage, ReadResult,
     RequestContext, SetAttributes, VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,

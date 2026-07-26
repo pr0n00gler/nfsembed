@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nfsserver::vfs::{
+use nfsembed::vfs::{
     CreateMode, CreatedObject, DeviceNumber, DirectoryEntry, ExportId, FileAttributes, FileType, FsInfo, FsStat,
     MutationResult, NfsError, NfsName, NfsTime, NodeType, ObjectKey, PathConf, Principal, ReadDirectoryPage,
     ReadResult, RequestContext, SetAttributes, VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult,

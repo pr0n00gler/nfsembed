@@ -3,12 +3,12 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use nfsserver::handles::HandleCodec;
-use nfsserver::nfs3::codec::EncodeNfsResult;
-use nfsserver::nfs3::procedures::{NfsArguments, WriteResult};
-use nfsserver::nfs3::types::{NfsStatus, WccData, WriteStability};
-use nfsserver::rpc::codec::{Decoder, Encoder};
-use nfsserver::vfs::{ExportId, ObjectKey};
+use nfsembed::handles::HandleCodec;
+use nfsembed::nfs3::codec::EncodeNfsResult;
+use nfsembed::nfs3::procedures::{NfsArguments, WriteResult};
+use nfsembed::nfs3::types::{NfsStatus, WccData, WriteStability};
+use nfsembed::rpc::codec::{Decoder, Encoder};
+use nfsembed::vfs::{ExportId, ObjectKey};
 
 fuzz_target!(|data: &[u8]| {
     const MAX_WRITE: usize = 4096;

@@ -2,7 +2,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsserver-cross-state.XXXXXX")
+state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsembed-cross-state.XXXXXX")
 ready_file=$state_dir/ready
 shutdown_file=$state_dir/shutdown
 server_log=$state_dir/server.log
@@ -31,10 +31,10 @@ while [ ! -s "$ready_file" ]; do
   sleep 0.1
 done
 
-docker build -t nfsserver-native-linux -f "$root/tests/native/Dockerfile" "$root"
+docker build -t nfsembed-native-linux -f "$root/tests/native/Dockerfile" "$root"
 if ! docker run --rm --privileged \
   -v "$root:/work" \
-  nfsserver-native-linux \
+  nfsembed-native-linux \
   ./tests/native/client.sh host.docker.internal "$(cat "$ready_file")"; then
   cat "$server_log" >&2
   exit 1

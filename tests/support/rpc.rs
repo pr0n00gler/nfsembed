@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use nfsserver::rpc::codec::{Decoder, Encoder};
-use nfsserver::rpc::record::{read_record, write_record, RecordLimits};
-use nfsserver::server::{AuthPolicy, NfsServer, PortmapperMode, ServerHandle, ServerLimits};
-use nfsserver::vfs::VirtualFileSystem;
+use nfsembed::rpc::codec::{Decoder, Encoder};
+use nfsembed::rpc::record::{read_record, write_record, RecordLimits};
+use nfsembed::server::{AuthPolicy, NfsServer, PortmapperMode, ServerHandle, ServerLimits};
+use nfsembed::vfs::VirtualFileSystem;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 

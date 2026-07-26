@@ -1,11 +1,11 @@
 [package]
-name = "nfsserver"
+name = "nfsembed"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.96"
 description = "A Rust NFS Server implementation"
-homepage = "https://github.com/pr0n00gler/nfsserver"
-repository = "https://github.com/pr0n00gler/nfsserver"
+homepage = "https://github.com/pr0n00gler/nfsembed"
+repository = "https://github.com/pr0n00gler/nfsembed"
 readme = "README.md"
 keywords = ["nfs"]
 license = "BSD-3-Clause"

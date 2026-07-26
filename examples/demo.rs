@@ -2,12 +2,12 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserver::vfs::{
+use nfsembed::vfs::{
     CreateMode, CreatedObject, DirectoryEntry, FileAttributes, FileType, FsInfo, FsStat, MutationResult, NfsError,
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
-use nfsserver::{AuthPolicy, NfsServer, PortmapperSockets};
+use nfsembed::{AuthPolicy, NfsServer, PortmapperSockets};
 use tokio::net::{TcpListener, UdpSocket};
 
 const ROOT_ID: u64 = 1;
@@ -464,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = NfsServer::builder(DemoFs::default())
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
-    if let Ok(address) = std::env::var("NFSSERVER_PORTMAPPER") {
+    if let Ok(address) = std::env::var("NFSEMBED_PORTMAPPER") {
         let portmapper_tcp = TcpListener::bind(address).await?;
         let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
         server

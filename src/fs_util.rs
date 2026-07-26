@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn failed_metadata_updates_return_an_nfs_error() {
         let missing = std::env::temp_dir().join(format!(
-            "nfsserver-missing-setattr-{}-{}",
+            "nfsembed-missing-setattr-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
