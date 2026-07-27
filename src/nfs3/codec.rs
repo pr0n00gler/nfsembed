@@ -437,6 +437,11 @@ pub fn encode_attributes(encoder: &mut Encoder, attributes: &FileAttributes) -> 
         FileType::Symlink => 5,
         FileType::Socket => 6,
         FileType::Fifo => 7,
+        // NFSv3 has no named-attribute object types. These are only
+        // reachable through NFSv4 OPENATTR, but preserve their ordinary
+        // directory/regular-file behavior if a backend is shared by v3.
+        FileType::AttributeDirectory => 2,
+        FileType::NamedAttribute => 1,
     });
     encoder.write_u32(attributes.mode);
     encoder.write_u32(attributes.links);
@@ -542,6 +547,7 @@ mod tests {
             device: Some(DeviceNumber { major: 12, minor: 34 }),
             fs_id: 1,
             file_id: 2,
+            change_id: 0.into(),
             access_time: NfsTime::default(),
             modify_time: NfsTime::default(),
             change_time: NfsTime::default(),
@@ -566,6 +572,7 @@ mod tests {
             device: Some(DeviceNumber { major: 12, minor: 34 }),
             fs_id: 1,
             file_id: 2,
+            change_id: 0.into(),
             access_time: NfsTime::default(),
             modify_time: NfsTime::default(),
             change_time: NfsTime::default(),
@@ -590,8 +597,9 @@ mod tests {
             device: None,
             fs_id: 1,
             file_id: 2,
+            change_id: 0.into(),
             access_time: NfsTime {
-                seconds: u64::from(u32::MAX) + 1,
+                seconds: i64::from(u32::MAX) + 1,
                 nanoseconds: 0,
             },
             modify_time: NfsTime::default(),

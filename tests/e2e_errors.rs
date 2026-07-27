@@ -3,7 +3,7 @@ mod support;
 use std::sync::Arc;
 
 use nfsembed::rpc::codec::{Decoder, Encoder};
-use nfsembed::server::{AuthPolicy, PortmapperMode, ServerLimits};
+use nfsembed::server::{AuthPolicy, ServerLimits};
 use nfsembed::vfs::{ExportId, NfsError, Principal};
 use support::rpc::{
     assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
@@ -437,13 +437,8 @@ async fn auth_policies_parse_auth_sys_reject_wrong_flavors_and_support_anonymous
     sys_server.shutdown().await;
 
     let anonymous_vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let anonymous_server = start_server_with(
-        anonymous_vfs.clone(),
-        ServerLimits::production_defaults(),
-        AuthPolicy::Anonymous,
-        PortmapperMode::Disabled,
-    )
-    .await;
+    let anonymous_server =
+        start_server_with(anonymous_vfs.clone(), ServerLimits::production_defaults(), AuthPolicy::Anonymous).await;
     let mut anonymous_client = RpcClient::connect(anonymous_server.address).await;
     anonymous_client.set_auth(Auth::None);
     let root = mount_root(&mut anonymous_client, b"/").await;

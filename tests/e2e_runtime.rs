@@ -4,8 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nfsembed::rpc::codec::{Decoder, Encoder};
-use nfsembed::server::{AuthPolicy, NfsServer, PortmapperMode, PortmapperSockets, ServerLimits};
-use nfsembed::vfs::ExportId;
+use nfsembed::server::{
+    AuthPolicy, ExportConfig, FileHandlePolicy, FileSystemId, NfsServer, NfsServerBuilder, PortmapperSockets,
+    ProtocolSet, SecurityPolicy, ServerError, ServerLimits, ServerSockets,
+};
+use nfsembed::vfs::{ExportId, VirtualFileSystem};
 use support::rpc::{
     assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
     parse_reply, record_header, rpc_call, start_built_server, start_server, start_server_with, Auth, RpcClient,
@@ -15,6 +18,24 @@ use support::vfs::ConformanceVfs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
+
+fn export_config(export_id: ExportId, path: impl Into<String>) -> ExportConfig {
+    ExportConfig::new(
+        export_id,
+        path,
+        FileSystemId::new(0, u64::from(export_id.0)),
+        SecurityPolicy::auth_sys(),
+        FileHandlePolicy::Volatile,
+    )
+}
+
+fn v3_builder(vfs: ConformanceVfs) -> NfsServerBuilder {
+    NfsServer::builder(ProtocolSet::V3).add_export_owned(export_config(ExportId(1), "/"), vfs)
+}
+
+fn v3_builder_arc(vfs: Arc<dyn VirtualFileSystem>) -> NfsServerBuilder {
+    NfsServer::builder(ProtocolSet::V3).add_export(export_config(ExportId(1), "/"), vfs)
+}
 
 async fn lookup_handle(client: &mut RpcClient, root: &[u8], name: &[u8]) -> Vec<u8> {
     let payload = nfs_payload(client.call(NFS_PROGRAM, NFS_VERSION, 3, &nfs_args_directory(root, name)).await);
@@ -96,85 +117,52 @@ fn builder_rejects_every_unbounded_or_ambiguous_configuration() {
     invalid_limits.push(limits);
 
     for limits in invalid_limits {
-        assert!(NfsServer::builder(ConformanceVfs::new(ExportId(1)))
-            .limits(limits)
-            .build()
-            .is_err());
+        assert!(v3_builder(ConformanceVfs::new(ExportId(1))).limits(limits).build().is_err());
     }
 
-    assert!(NfsServer::builder(ConformanceVfs::new(ExportId(1)))
-        .export_name("bad/")
+    assert!(NfsServer::builder(ProtocolSet::V3)
+        .add_export_owned(export_config(ExportId(1), "/bad/"), ConformanceVfs::new(ExportId(1)),)
         .build()
         .is_err());
-    assert!(NfsServer::builder(ConformanceVfs::new(ExportId(1)))
-        .export_name("same")
-        .add_export(ExportId(1), "other", ConformanceVfs::new(ExportId(1)))
+    assert!(NfsServer::builder(ProtocolSet::V3)
+        .add_export_owned(export_config(ExportId(1), "/same"), ConformanceVfs::new(ExportId(1)),)
+        .add_export_owned(export_config(ExportId(1), "/other"), ConformanceVfs::new(ExportId(1)),)
         .build()
         .is_err());
-    assert!(NfsServer::builder(ConformanceVfs::new(ExportId(1)))
-        .export_name("same")
-        .add_export(ExportId(2), "same", ConformanceVfs::new(ExportId(2)))
+    assert!(NfsServer::builder(ProtocolSet::V3)
+        .add_export_owned(export_config(ExportId(1), "/same"), ConformanceVfs::new(ExportId(1)),)
+        .add_export_owned(export_config(ExportId(2), "/same"), ConformanceVfs::new(ExportId(2)),)
         .build()
         .is_err());
 }
 
 #[tokio::test]
-async fn optional_portmapper_only_returns_supported_tcp_mappings() {
-    let disabled_vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let disabled = start_server(disabled_vfs).await;
-    let mut client = RpcClient::connect(disabled.address).await;
+async fn nfs_listener_never_exposes_an_in_band_portmapper() {
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    let running = start_server(vfs).await;
+    let mut client = RpcClient::connect(running.address).await;
     let (status, payload) = client.call(PORTMAP_PROGRAM, PORTMAP_VERSION, 0, &[]).await.accepted();
     assert_eq!(status, 1);
     assert!(payload.is_empty());
-    disabled.shutdown().await;
-
-    let enabled_vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let enabled = start_server_with(
-        enabled_vfs,
-        ServerLimits::production_defaults(),
-        AuthPolicy::AuthSys,
-        PortmapperMode::Enabled,
-    )
-    .await;
-    let mut client = RpcClient::connect(enabled.address).await;
-    client.set_auth(Auth::None);
-    let (status, payload) = client.call(PORTMAP_PROGRAM, PORTMAP_VERSION, 0, &[]).await.accepted();
-    assert_eq!(status, 0);
-    assert!(payload.is_empty());
-    let (status, payload) = client.call(PORTMAP_PROGRAM, PORTMAP_VERSION, 0, &[0, 0, 0, 0]).await.accepted();
-    assert_eq!(status, 4);
-    assert!(payload.is_empty());
-
-    for (program, version, protocol, expected) in [
-        (NFS_PROGRAM, NFS_VERSION, 6, enabled.address.port() as u32),
-        (MOUNT_PROGRAM, MOUNT_VERSION, 6, enabled.address.port() as u32),
-        (NFS_PROGRAM, NFS_VERSION, 17, 0),
-        (NFS_PROGRAM, 2, 6, 0),
-        (999_999, 1, 6, 0),
-    ] {
-        let (status, payload) = client
-            .call(PORTMAP_PROGRAM, PORTMAP_VERSION, 3, &portmap_arguments(program, version, protocol))
-            .await
-            .accepted();
-        assert_eq!(status, 0);
-        assert_eq!(u32::from_be_bytes(payload.try_into().unwrap()), expected);
-    }
-
-    enabled.shutdown().await;
+    running.shutdown().await;
 }
 
 #[tokio::test]
 async fn standalone_portmapper_serves_tcp_and_udp_and_shares_server_lifecycle() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let nfs_addr = listener.local_addr().unwrap();
+    let mount_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let portmapper_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let portmapper_addr = portmapper_tcp.local_addr().unwrap();
     let portmapper_udp = UdpSocket::bind(portmapper_addr).await.unwrap();
-    let server = NfsServer::builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
+    let server = v3_builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
     let handle = server
-        .start_with_portmapper(
-            listener,
-            PortmapperSockets::new(portmapper_tcp, portmapper_udp).advertised_ports(40_049, 40_048),
+        .start(
+            ServerSockets::new(listener)
+                .with_mount_listener(mount_listener)
+                .with_portmapper(
+                    PortmapperSockets::new(portmapper_tcp, portmapper_udp).advertised_ports(40_049, 40_048),
+                ),
         )
         .await
         .unwrap();
@@ -236,7 +224,9 @@ async fn standalone_portmapper_serves_tcp_and_udp_and_shares_server_lifecycle() 
     // Neither malformed traffic nor an unreachable UDP peer may terminate the
     // shared NFS lifecycle.
     let mut nfs = RpcClient::connect(nfs_addr).await;
-    assert!(!mount_root(&mut nfs, b"/").await.is_empty());
+    let (status, payload) = nfs.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
+    assert_eq!(status, 0);
+    assert!(payload.is_empty());
     handle.shutdown().await.unwrap();
     handle.wait().await.unwrap();
 
@@ -259,9 +249,9 @@ async fn standalone_portmapper_rejects_mismatched_socket_addresses() {
         same_port_sockets.push(socket);
     };
     assert_ne!(portmapper_tcp.local_addr().unwrap(), portmapper_udp.local_addr().unwrap());
-    let server = NfsServer::builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
+    let server = v3_builder(ConformanceVfs::new(ExportId(1))).build().unwrap();
     assert!(server
-        .start_with_portmapper(listener, PortmapperSockets::new(portmapper_tcp, portmapper_udp))
+        .start(ServerSockets::new(listener).with_portmapper(PortmapperSockets::new(portmapper_tcp, portmapper_udp)),)
         .await
         .is_err());
 }
@@ -269,27 +259,39 @@ async fn standalone_portmapper_rejects_mismatched_socket_addresses() {
 #[tokio::test]
 async fn restart_of_same_server_configuration_rotates_handles_and_write_verifier() {
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = NfsServer::builder_arc(vfs).build().unwrap();
+    let server = v3_builder_arc(vfs).build().unwrap();
 
     let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let first_handle = server.start(first_listener).await.unwrap();
-    let mut first_client = RpcClient::connect(first_handle.mount_info().server_addr).await;
-    let first_root = mount_root(&mut first_client, b"/").await;
+    let first_mount_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_mount_address = first_mount_listener.local_addr().unwrap();
+    let first_handle = server
+        .start(ServerSockets::new(first_listener).with_mount_listener(first_mount_listener))
+        .await
+        .unwrap();
+    let mut first_client = RpcClient::connect(first_handle.endpoint_info().address).await;
+    let mut first_mount_client = RpcClient::connect(first_mount_address).await;
+    let first_root = mount_root(&mut first_mount_client, b"/").await;
     let first_file = lookup_handle(&mut first_client, &first_root, b"file").await;
     let first_verifier = write_and_decode_verifier(&mut first_client, &first_file, 900).await;
     first_handle.shutdown().await.unwrap();
     first_handle.wait().await.unwrap();
 
     let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let second_handle = server.start(second_listener).await.unwrap();
-    let mut second_client = RpcClient::connect(second_handle.mount_info().server_addr).await;
+    let second_mount_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_mount_address = second_mount_listener.local_addr().unwrap();
+    let second_handle = server
+        .start(ServerSockets::new(second_listener).with_mount_listener(second_mount_listener))
+        .await
+        .unwrap();
+    let mut second_client = RpcClient::connect(second_handle.endpoint_info().address).await;
     let stale = nfs_payload(
         second_client
             .call(NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&first_root))
             .await,
     );
     assert_eq!(u32::from_be_bytes(stale[..4].try_into().unwrap()), 70);
-    let second_root = mount_root(&mut second_client, b"/").await;
+    let mut second_mount_client = RpcClient::connect(second_mount_address).await;
+    let second_root = mount_root(&mut second_mount_client, b"/").await;
     let second_file = lookup_handle(&mut second_client, &second_root, b"file").await;
     let second_verifier = write_and_decode_verifier(&mut second_client, &second_file, 901).await;
     assert_ne!(first_root, second_root);
@@ -324,11 +326,11 @@ async fn auth_sys_stamp_changes_do_not_bypass_completed_replay() {
 }
 
 #[tokio::test]
-async fn timed_out_mutation_is_cancelled_and_same_xid_can_execute_again() {
+async fn timed_out_mutation_completes_and_same_xid_replays_without_reexecution() {
     let mut limits = ServerLimits::production_defaults();
     limits.request_timeout = Duration::from_millis(30);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let file = lookup_handle(&mut client, &root, b"file").await;
@@ -339,12 +341,20 @@ async fn timed_out_mutation_is_cancelled_and_same_xid_can_execute_again() {
         client.call_with_xid(920, NFS_PROGRAM, NFS_VERSION, 7, &arguments).await,
         RpcOutcome::Accepted { status: 5, .. }
     ));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(vfs.active_delays(), 0);
     vfs.clear_delay_after("write");
-    let replay = client.call_with_xid(920, NFS_PROGRAM, NFS_VERSION, 7, &arguments).await;
-    assert_eq!(u32::from_be_bytes(nfs_payload(replay)[..4].try_into().unwrap()), 0);
-    assert_eq!(vfs.call_count("write"), 2);
+    let replay = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            match client.call_with_xid(920, NFS_PROGRAM, NFS_VERSION, 7, &arguments).await {
+                RpcOutcome::Accepted { status: 0, payload, .. } => break payload,
+                RpcOutcome::Accepted { status: 5, .. } => {},
+                other => panic!("unexpected replay outcome: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("shielded mutation did not complete within the bounded test interval");
+    assert_eq!(u32::from_be_bytes(replay[..4].try_into().unwrap()), 0);
+    assert_eq!(vfs.call_count("write"), 1);
     server.shutdown().await;
 }
 
@@ -354,7 +364,7 @@ async fn never_returning_vfs_calls_release_the_global_execution_permit() {
     limits.max_inflight_requests = 1;
     limits.request_timeout = Duration::from_millis(30);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     vfs.delay("getattr", Duration::from_secs(60));
@@ -381,7 +391,7 @@ async fn wait_is_cancellation_safe_and_concurrent_waiters_observe_termination() 
     limits.request_timeout = Duration::from_secs(1);
     limits.graceful_shutdown_timeout = Duration::from_secs(1);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let running = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let running = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(running.address).await;
     let root = mount_root(&mut client, b"/").await;
     vfs.delay("getattr", Duration::from_millis(120));
@@ -412,11 +422,10 @@ async fn oversized_and_overfragmented_outbound_replies_become_system_errors() {
         limits.max_read_size = 100;
         limits.max_write_size = 100;
         limits.max_readdir_response_size = 600;
-        let mut builder = NfsServer::builder(ConformanceVfs::new(ExportId(1))).limits(limits);
+        let mut builder = v3_builder(ConformanceVfs::new(ExportId(1))).limits(limits);
         for id in 2..=24 {
-            builder = builder.add_export(
-                ExportId(id),
-                format!("export-{id}-with-a-long-name"),
+            builder = builder.add_export_owned(
+                export_config(ExportId(id), format!("/export-{id}-with-a-long-name")),
                 ConformanceVfs::new(ExportId(id)),
             );
         }
@@ -451,10 +460,7 @@ async fn configuration_rejects_a_transport_that_cannot_carry_mutation_results() 
     let mut limits = ServerLimits::production_defaults();
     limits.max_rpc_record_size = 128;
     limits.max_rpc_fragment_size = 128;
-    assert!(NfsServer::builder(ConformanceVfs::new(ExportId(1)))
-        .limits(limits)
-        .build()
-        .is_err());
+    assert!(v3_builder(ConformanceVfs::new(ExportId(1))).limits(limits).build().is_err());
 }
 
 #[tokio::test]
@@ -466,7 +472,7 @@ async fn fsinfo_transfer_values_fit_the_effective_transport_capacity() {
     limits.max_write_size = 400;
     limits.max_readdir_response_size = 900;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let payload = nfs_payload(client.call(NFS_PROGRAM, NFS_VERSION, 19, &nfs_args_handle(&root)).await);
@@ -489,7 +495,7 @@ async fn dropping_handle_aborts_tracked_executions_without_a_reference_cycle() {
     limits.request_timeout = Duration::from_secs(60);
     limits.graceful_shutdown_timeout = Duration::from_secs(60);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let running = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let running = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(running.address).await;
     let root = mount_root(&mut client, b"/").await;
     vfs.delay("getattr", Duration::from_secs(60));
@@ -507,19 +513,13 @@ async fn dropping_handle_aborts_tracked_executions_without_a_reference_cycle() {
         }
     })
     .await
-    .expect("tracked VFS execution leaked after ServerHandle drop");
+    .expect("tracked VFS execution leaked after NfsServerHandle drop");
 }
 
 #[tokio::test]
 async fn mount_advertises_every_accepted_auth_flavor() {
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let running = start_server_with(
-        vfs,
-        ServerLimits::production_defaults(),
-        AuthPolicy::AuthSysOrAnonymous,
-        PortmapperMode::Disabled,
-    )
-    .await;
+    let running = start_server_with(vfs, ServerLimits::production_defaults(), AuthPolicy::AuthSysOrAnonymous).await;
     let mut client = RpcClient::connect(running.address).await;
     let mut path = Encoder::new();
     path.write_opaque(b"/").unwrap();
@@ -561,7 +561,10 @@ async fn write_and_decode_verifier(client: &mut RpcClient, file: &[u8], xid: u32
 #[tokio::test]
 async fn mount_matching_preserves_boundaries_lengths_types_and_backend_errors() {
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = NfsServer::builder_arc(vfs.clone()).export_name("data").build().unwrap();
+    let server = NfsServer::builder(ProtocolSet::V3)
+        .add_export(export_config(ExportId(1), "/data"), vfs.clone())
+        .build()
+        .unwrap();
     let running = start_built_server(server).await;
     let mut client = RpcClient::connect(running.address).await;
     let _root = mount_root(&mut client, b"/data").await;
@@ -684,7 +687,7 @@ async fn replay_ttl_and_capacity_bound_completed_entries() {
     limits.replay_cache_ttl = Duration::from_millis(40);
     limits.replay_cache_capacity = 1;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let baseline = vfs.call_count("getattr");
@@ -714,7 +717,7 @@ async fn replay_byte_budget_skips_replies_that_cannot_fit() {
     let mut limits = ServerLimits::production_defaults();
     limits.replay_cache_max_bytes = 32;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let baseline = vfs.call_count("getattr");
@@ -735,7 +738,7 @@ async fn connection_and_global_request_limits_backpressure_without_affecting_hos
     let mut connection_limits = ServerLimits::production_defaults();
     connection_limits.max_connections = 1;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs, connection_limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, connection_limits, AuthPolicy::AuthSys).await;
     let mut first = RpcClient::connect(server.address).await;
     let (status, _) = first.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
     assert_eq!(status, 0);
@@ -753,7 +756,7 @@ async fn connection_and_global_request_limits_backpressure_without_affecting_hos
     let mut request_limits = ServerLimits::production_defaults();
     request_limits.max_inflight_requests = 1;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), request_limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), request_limits, AuthPolicy::AuthSys).await;
     let mut first = RpcClient::connect(server.address).await;
     let mut second = RpcClient::connect(server.address).await;
     let root = mount_root(&mut first, b"/").await;
@@ -788,7 +791,7 @@ async fn aggregate_byte_budgets_bound_large_records_across_connections() {
     limits.max_read_size = WRITE_SIZE as u32;
     limits.max_readdir_response_size = WRITE_SIZE as u32;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut first = RpcClient::connect(server.address).await;
     let mut second = RpcClient::connect(server.address).await;
     let first_root = mount_root(&mut first, b"/").await;
@@ -823,7 +826,7 @@ async fn slow_reader_is_disconnected_and_releases_its_connection_slot() {
     limits.request_timeout = Duration::from_millis(50);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
     vfs.set_data(vec![0x7a; 1024 * 1024]);
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys).await;
     let mut slow = RpcClient::connect(server.address).await;
     let root = mount_root(&mut slow, b"/").await;
     let file = lookup_handle(&mut slow, &root, b"file").await;
@@ -836,9 +839,35 @@ async fn slow_reader_is_disconnected_and_releases_its_connection_slot() {
         slow.send_without_reading(xid, NFS_PROGRAM, NFS_VERSION, 6, &read).await;
     }
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut replacement = RpcClient::connect(server.address).await;
-    let (status, payload) = replacement.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
+    let replacement_reply = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let reply = async {
+                let mut stream = TcpStream::connect(server.address).await.ok()?;
+                let request = rpc_call(1, 2, NFS_PROGRAM, NFS_VERSION, 0, &[], &Auth::Sys);
+                stream.write_all(&record_header(request.len(), true)).await.ok()?;
+                stream.write_all(&request).await.ok()?;
+
+                let mut marker = [0_u8; 4];
+                stream.read_exact(&mut marker).await.ok()?;
+                let marker = u32::from_be_bytes(marker);
+                if marker & 0x8000_0000 == 0 {
+                    return None;
+                }
+                let length = usize::try_from(marker & 0x7fff_ffff).ok()?;
+                let mut record = vec![0_u8; length];
+                stream.read_exact(&mut record).await.ok()?;
+                Some(parse_reply(&record))
+            }
+            .await;
+            if let Some(reply) = reply {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("slow reader did not release its connection slot");
+    let (status, payload) = replacement_reply.accepted();
     assert_eq!(status, 0);
     assert!(payload.is_empty());
     drop(slow);
@@ -852,7 +881,7 @@ async fn per_connection_request_limit_controls_pipelined_concurrency() {
         limits.max_requests_per_connection = limit;
         limits.max_inflight_requests = 2;
         let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-        let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+        let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
         let mut client = RpcClient::connect(server.address).await;
         let root = mount_root(&mut client, b"/").await;
         let file = lookup_handle(&mut client, &root, b"file").await;
@@ -880,7 +909,7 @@ async fn concurrent_mutations_run_within_limit_and_shutdown_deadline_cancels_slo
     limits.graceful_shutdown_timeout = Duration::from_millis(100);
     limits.request_timeout = Duration::from_secs(10);
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut first = RpcClient::connect(server.address).await;
     let mut second = RpcClient::connect(server.address).await;
     let root = mount_root(&mut first, b"/").await;
@@ -923,7 +952,7 @@ async fn concurrent_mutations_run_within_limit_and_shutdown_deadline_cancels_slo
     }
     let shutdown_started = Instant::now();
     server.handle.shutdown().await.unwrap();
-    server.handle.wait().await.unwrap();
+    assert!(matches!(server.handle.wait().await, Err(ServerError::RequestTimeout)));
     assert!(shutdown_started.elapsed() < Duration::from_millis(500));
 }
 
@@ -931,13 +960,13 @@ async fn concurrent_mutations_run_within_limit_and_shutdown_deadline_cancels_slo
 async fn handles_are_scoped_to_server_export_and_integrity_tag() {
     let first_vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
     let second_vfs = Arc::new(ConformanceVfs::new(ExportId(2)));
-    let server = NfsServer::builder_arc(first_vfs.clone())
-        .export_name("first")
-        .add_export_arc(ExportId(2), "second", second_vfs.clone())
+    let server = NfsServer::builder(ProtocolSet::V3)
+        .add_export(export_config(ExportId(1), "/first"), first_vfs.clone())
+        .add_export(export_config(ExportId(2), "/second"), second_vfs.clone())
         .build()
         .unwrap();
     let running = start_built_server(server).await;
-    assert_eq!(running.handle.mount_infos().len(), 2);
+    assert_eq!(running.handle.endpoint_infos().len(), 2);
     let mut client = RpcClient::connect(running.address).await;
     let first_root = mount_root(&mut client, b"/first").await;
     let second_root = mount_root(&mut client, b"/second").await;
@@ -997,7 +1026,7 @@ async fn transfer_directory_timeout_idle_and_mount_limits_are_enforced() {
     limits.idle_connection_timeout = Duration::from_millis(80);
     limits.max_mounts = 1;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let file = lookup_handle(&mut client, &root, b"file").await;
@@ -1133,7 +1162,7 @@ async fn hostile_fragments_close_only_their_connection_and_server_stays_healthy(
     limits.max_write_size = 100;
     limits.max_readdir_response_size = 600;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys).await;
 
     let mut oversized = TcpStream::connect(server.address).await.unwrap();
     oversized.write_all(&record_header(257, true)).await.unwrap();
@@ -1176,13 +1205,13 @@ async fn lifecycle_is_waitable_idempotent_nonspawning_and_cancels_idle_connectio
     assert!(started.elapsed() < Duration::from_secs(1));
 
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let nfs_server = NfsServer::builder_arc(vfs).build().unwrap();
+    let nfs_server = v3_builder_arc(vfs).build().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let application_task = tokio::spawn(async move {
         nfs_server
-            .serve(listener, async {
+            .serve(ServerSockets::new(listener), async {
                 let _ = shutdown_receive.await;
             })
             .await

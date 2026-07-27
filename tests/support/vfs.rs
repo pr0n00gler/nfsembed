@@ -305,6 +305,7 @@ impl ConformanceVfs {
             device: (object == DEVICE).then_some(DeviceNumber { major: 12, minor: 34 }),
             fs_id: 55,
             file_id: object.file_id,
+            change_id: object.file_id.into(),
             access_time: NfsTime {
                 seconds: 10,
                 nanoseconds: 11,
@@ -324,6 +325,7 @@ impl ConformanceVfs {
         let attributes = Self::attributes(object).unwrap();
         WccAttributes {
             size: attributes.size,
+            change_id: attributes.change_id,
             modify_time: attributes.modify_time,
             change_time: attributes.change_time,
         }
@@ -332,6 +334,7 @@ impl ConformanceVfs {
     fn mutation<T>(object: ObjectKey, value: T) -> MutationResult<T> {
         MutationResult {
             value,
+            change_info: None,
             before: Some(Self::wcc(object)),
             after: Self::attributes(object).ok(),
         }
@@ -343,6 +346,7 @@ impl ConformanceVfs {
                 object,
                 attributes: Self::attributes(object).ok(),
             },
+            change_info: None,
             before: Some(Self::wcc(ROOT)),
             after: Self::attributes(ROOT).ok(),
         }

@@ -1,0 +1,115 @@
+name: nfsembed-local
+
+services:
+  tools:
+    build:
+      context: .
+      dockerfile: tests/docker/tools.Dockerfile
+      args:
+        CARGO_FUZZ_VERSION: "0.13.2"
+        NIGHTLY_TOOLCHAIN: "nightly-2026-07-01"
+    init: true
+    working_dir: /workspace
+    environment:
+      CARGO_HOME: /cargo
+      CARGO_TARGET_DIR: /target
+      KRB5_CONFIG: /etc/krb5.conf
+      NIGHTLY_TOOLCHAIN: nightly-2026-07-01
+      NFSEMBED_GSS_CLIENT_KEYTAB: /run/nfsembed-kdc/client.keytab
+      NFSEMBED_GSS_SERVER_KEYTAB: /run/nfsembed-kdc/nfs.keytab
+      SSPI_KDC_URL: tcp://kdc:88
+    volumes:
+      - .:/workspace
+      - ./tests/docker/kerberos/krb5.conf:/etc/krb5.conf:ro
+      - cargo-home:/cargo
+      - cargo-target:/target
+      - fuzz-artifacts:/workspace/fuzz/artifacts
+      - fuzz-corpus:/workspace/fuzz/corpus
+      - fuzz-target:/workspace/fuzz/target
+      - kdc-keytabs:/run/nfsembed-kdc:ro
+    networks:
+      - tooling
+
+  script-runner:
+    profiles:
+      - scripts
+    image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+    init: true
+    working_dir: /workspace
+    entrypoint:
+      - python3
+    volumes:
+      - .:/workspace:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - tooling
+
+  pynfs:
+    profiles:
+      - interop
+    build:
+      context: .
+      dockerfile: tests/docker/pynfs.Dockerfile
+      args:
+        PYNFS_REF: cd4701827a8261fedbfb4c6e39029fb9671321a6
+    init: true
+    environment:
+      KRB5_CLIENT_KTNAME: /run/nfsembed-kdc/client.keytab
+      KRB5_CLIENT_PRINCIPAL: client@NFSEMBED.TEST
+      KRB5_CONFIG: /etc/krb5.conf
+      PYNFS_EXPORT: ${PYNFS_EXPORT:-/}
+      PYNFS_SERVER: ${PYNFS_SERVER:-}
+      PYNFS_TESTS: ${PYNFS_TESTS:-all}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - kdc-keytabs:/run/nfsembed-kdc:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - tooling
+
+  kdc:
+    profiles:
+      - kerberos
+    build:
+      context: .
+      dockerfile: tests/docker/kdc.Dockerfile
+    hostname: kdc.nfsembed.test
+    environment:
+      KRB5_CLIENT_PRINCIPAL: client
+      KRB5_CONFIG: /etc/krb5.conf
+      KRB5_KDC_PROFILE: /etc/krb5kdc/kdc.conf
+      KRB5_NFS_PRINCIPAL: nfs/server.nfsembed.test
+      KRB5_REALM: NFSEMBED.TEST
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          kadmin --local --realm="$$KRB5_REALM"
+          --config-file="$$KRB5_KDC_PROFILE"
+          get "$$KRB5_CLIENT_PRINCIPAL@$$KRB5_REALM"
+          >/dev/null 2>&1
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    volumes:
+      - kdc-database:/var/lib/krb5kdc
+      - kdc-keytabs:/run/nfsembed-kdc
+    networks:
+      tooling:
+        aliases:
+          - kdc
+
+volumes:
+  cargo-home:
+  cargo-target:
+  fuzz-artifacts:
+  fuzz-corpus:
+  fuzz-target:
+  kdc-database:
+  kdc-keytabs:
+
+networks:
+  tooling:

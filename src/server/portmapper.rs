@@ -7,7 +7,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::{ServerError, ServerLimits};
+use super::{ProtocolSet, ServerError, ServerLimits};
 use crate::portmap::mapping;
 use crate::rpc::auth::{decode_principal, AUTH_NONE};
 use crate::rpc::codec::{Decoder, Encoder};
@@ -54,15 +54,21 @@ impl PortmapperSockets {
 
     /// Overrides the NFS and MOUNT ports returned by `GETPORT`.
     ///
-    /// By default both mappings use the primary NFS listener's bound port.
-    /// This override is useful when a transport proxy sits in front of the
-    /// embedded server.
+    /// By default NFS uses the primary NFS listener's port and MOUNT uses its
+    /// dedicated listener's port. This override is useful when a transport
+    /// proxy sits in front of the embedded server. An override never creates
+    /// a MOUNT mapping when no MOUNT listener was supplied.
     pub fn advertised_ports(mut self, nfs_port: u16, mount_port: u16) -> Self {
         self.advertised_ports = Some((nfs_port, mount_port));
         self
     }
 
-    pub(crate) fn prepare(self, primary_port: u16) -> Result<PreparedPortmapper, ServerError> {
+    pub(crate) fn prepare(
+        self,
+        nfs_listener_port: u16,
+        mount_listener_port: Option<u16>,
+        protocols: ProtocolSet,
+    ) -> Result<PreparedPortmapper, ServerError> {
         let tcp_addr = self.tcp.local_addr()?;
         let udp_addr = self.udp.local_addr()?;
         if tcp_addr != udp_addr {
@@ -70,11 +76,14 @@ impl PortmapperSockets {
                 "portmapper TCP and UDP sockets must use the same local address",
             ));
         }
-        if tcp_addr.port() == 0 || primary_port == 0 {
+        if tcp_addr.port() == 0 || nfs_listener_port == 0 || mount_listener_port.is_some_and(|port| port == 0) {
             return Err(ServerError::InvalidConfiguration("listener ports must be bound and non-zero"));
         }
-        let (nfs_port, mount_port) = self.advertised_ports.unwrap_or((primary_port, primary_port));
-        if nfs_port == 0 || mount_port == 0 {
+        let (nfs_port, mount_port) = match self.advertised_ports {
+            Some((nfs_port, mount_port)) => (nfs_port, mount_listener_port.map(|_| mount_port)),
+            None => (nfs_listener_port, mount_listener_port),
+        };
+        if nfs_port == 0 || mount_port.is_some_and(|port| port == 0) {
             return Err(ServerError::InvalidConfiguration("advertised NFS and MOUNT ports must be non-zero"));
         }
         Ok(PreparedPortmapper {
@@ -83,6 +92,7 @@ impl PortmapperSockets {
             local_addr: tcp_addr,
             nfs_port,
             mount_port,
+            protocols,
         })
     }
 }
@@ -92,7 +102,8 @@ pub(crate) struct PreparedPortmapper {
     udp: UdpSocket,
     pub local_addr: SocketAddr,
     nfs_port: u16,
-    mount_port: u16,
+    mount_port: Option<u16>,
+    protocols: ProtocolSet,
 }
 
 pub(crate) async fn run_portmapper(
@@ -107,8 +118,9 @@ pub(crate) async fn run_portmapper(
         local_addr,
         nfs_port,
         mount_port,
+        protocols,
     } = portmapper;
-    tracing::debug!(address = %local_addr, nfs_port, mount_port, "portmapper started");
+    tracing::debug!(address = %local_addr, nfs_port, ?mount_port, ?protocols, "portmapper started");
     let mut tasks = JoinSet::new();
     // Winsock reports WSAEMSGSIZE instead of returning a truncated length when
     // the receive buffer is too small. A maximum-size buffer lets every valid
@@ -144,6 +156,7 @@ pub(crate) async fn run_portmapper(
                         client_addr,
                         nfs_port,
                         mount_port,
+                        protocols,
                         connection_shutdown,
                         &connection_limits,
                     ).await {
@@ -169,7 +182,7 @@ pub(crate) async fn run_portmapper(
                     tracing::debug!(client = %client_addr, bytes = length, "oversized portmapper datagram dropped");
                     continue;
                 }
-                if let Some(reply) = dispatch_record(&datagram[..length], nfs_port, mount_port) {
+                if let Some(reply) = dispatch_record(&datagram[..length], nfs_port, mount_port, protocols) {
                     match timeout(limits.request_timeout, udp.send_to(&reply, client_addr)).await {
                         Ok(Ok(_)) => {},
                         Ok(Err(error)) => tracing::debug!(client = %client_addr, error = %error, "portmapper UDP reply failed"),
@@ -193,7 +206,8 @@ async fn serve_tcp_connection(
     mut stream: TcpStream,
     client_addr: SocketAddr,
     nfs_port: u16,
-    mount_port: u16,
+    mount_port: Option<u16>,
+    protocols: ProtocolSet,
     mut shutdown: watch::Receiver<bool>,
     limits: &ServerLimits,
 ) -> Result<(), ServerError> {
@@ -224,7 +238,7 @@ async fn serve_tcp_connection(
                 }
             }
         };
-        let Some(reply) = dispatch_record(&record, nfs_port, mount_port) else {
+        let Some(reply) = dispatch_record(&record, nfs_port, mount_port, protocols) else {
             tracing::debug!(client = %client_addr, "malformed portmapper record dropped");
             continue;
         };
@@ -235,7 +249,7 @@ async fn serve_tcp_connection(
     }
 }
 
-fn dispatch_record(record: &[u8], nfs_port: u16, mount_port: u16) -> Option<Vec<u8>> {
+fn dispatch_record(record: &[u8], nfs_port: u16, mount_port: Option<u16>, protocols: ProtocolSet) -> Option<Vec<u8>> {
     let mut decoder = Decoder::new(record);
     let xid = decoder.read_u32().ok()?;
     let message_type = match decoder.read_u32() {
@@ -315,7 +329,13 @@ fn dispatch_record(record: &[u8], nfs_port: u16, mount_port: u16) -> Option<Vec<
                 return Some(accepted_reply(xid, GARBAGE_ARGS, &[]));
             };
             let mut body = Encoder::new();
-            body.write_u32(crate::portmap::dispatch::get_port(&request, nfs_port, mount_port));
+            body.write_u32(crate::portmap::dispatch::get_port(
+                &request,
+                nfs_port,
+                mount_port,
+                protocols.includes_v3(),
+                protocols.includes_v4(),
+            ));
             Some(accepted_reply(xid, SUCCESS, &body.into_bytes()))
         },
         _ => Some(accepted_reply(xid, PROC_UNAVAIL, &[])),
@@ -398,16 +418,21 @@ mod tests {
         let reply = dispatch_record(
             &call(7, 2, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_GETPORT, &args.into_bytes()),
             40_049,
-            40_048,
+            Some(40_048),
+            ProtocolSet::V3,
         )
         .unwrap();
         let (xid, status, body) = outcome(&reply);
         assert_eq!((xid, status), (7, SUCCESS));
         assert_eq!(u32::from_be_bytes(body.try_into().unwrap()), 40_049);
 
-        let mismatch =
-            dispatch_record(&call(8, 1, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_NULL, &[]), 1, 1)
-                .unwrap();
+        let mismatch = dispatch_record(
+            &call(8, 1, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_NULL, &[]),
+            1,
+            Some(1),
+            ProtocolSet::V3,
+        )
+        .unwrap();
         let mut decoder = Decoder::new(&mismatch);
         assert_eq!(decoder.read_u32().unwrap(), 8);
         assert_eq!(decoder.read_u32().unwrap(), RPC_REPLY);
@@ -416,11 +441,28 @@ mod tests {
         assert_eq!((decoder.read_u32().unwrap(), decoder.read_u32().unwrap()), (2, 2));
         decoder.finish().unwrap();
 
-        let unavailable = dispatch_record(&call(9, 2, 999_999, 1, 0, &[]), 1, 1).unwrap();
+        let unavailable = dispatch_record(&call(9, 2, 999_999, 1, 0, &[]), 1, Some(1), ProtocolSet::V3).unwrap();
         assert_eq!(outcome(&unavailable).1, PROG_UNAVAIL);
-        let bad_args =
-            dispatch_record(&call(10, 2, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_GETPORT, &[]), 1, 1)
-                .unwrap();
+        let bad_args = dispatch_record(
+            &call(10, 2, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_GETPORT, &[]),
+            1,
+            Some(1),
+            ProtocolSet::V3,
+        )
+        .unwrap();
         assert_eq!(outcome(&bad_args).1, GARBAGE_ARGS);
+    }
+
+    #[tokio::test]
+    async fn advertised_override_cannot_invent_an_absent_mount_service() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(address).await.unwrap();
+        let prepared = PortmapperSockets::new(tcp, udp)
+            .advertised_ports(40_049, 40_048)
+            .prepare(20_049, None, ProtocolSet::V3)
+            .unwrap();
+        assert_eq!(prepared.nfs_port, 40_049);
+        assert_eq!(prepared.mount_port, None);
     }
 }

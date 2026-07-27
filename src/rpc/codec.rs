@@ -209,7 +209,7 @@ pub enum EncodeError {
     #[error("value of {0} bytes cannot be represented in XDR")]
     TooLarge(usize),
     #[error("NFS time {seconds}.{nanoseconds:09} cannot be represented on the wire")]
-    InvalidTime { seconds: u64, nanoseconds: u32 },
+    InvalidTime { seconds: i64, nanoseconds: u32 },
 }
 
 impl fmt::Debug for Decoder<'_> {

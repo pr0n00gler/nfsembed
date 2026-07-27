@@ -61,13 +61,15 @@ run_profile() {
   state="/tmp/nfsembed-linux-server-$profile"
   limactl shell "$instance" -- sh -lc "rm -rf '$state'; mkdir -p '$state'; nohup sh '$guest_root/tests/native/certification_server_process.sh' '$guest_root' '0.0.0.0:$port' '$state' '$profile' '$state/restart' >'$state/server.log' 2>&1 </dev/null & echo \$! >'$state/pid'"
   wait_ready
+  mount_port=$(limactl shell "$instance" -- sh -lc "set -- \$(cat '$state/ready'); printf '%s\\n' \"\$2\"")
 
-  "$root/tests/native/client.sh" 127.0.0.1 "$port" "$client_mode"
+  "$root/tests/native/client.sh" 127.0.0.1 "$port" "$client_mode" "$mount_port"
   if [ "$profile" = "read-write" ]; then
-    "$root/tests/native/client.sh" 127.0.0.1 "$port" restart-prepare
+    "$root/tests/native/client.sh" 127.0.0.1 "$port" restart-prepare "$mount_port"
     limactl shell "$instance" -- sh -lc "rm -f '$state/ready'; touch '$state/restart'"
     wait_ready
-    "$root/tests/native/client.sh" 127.0.0.1 "$port" restart-verify
+    mount_port=$(limactl shell "$instance" -- sh -lc "set -- \$(cat '$state/ready'); printf '%s\\n' \"\$2\"")
+    "$root/tests/native/client.sh" 127.0.0.1 "$port" restart-verify "$mount_port"
   fi
   stop_server
   state=

@@ -372,7 +372,7 @@ fn decode_directory_operation(decoder: &mut Decoder<'_>) -> Result<DirectoryOper
 }
 
 fn decode_time(decoder: &mut Decoder<'_>) -> Result<NfsTime, DecodeError> {
-    let seconds = u64::from(decoder.read_u32()?);
+    let seconds = i64::from(decoder.read_u32()?);
     let nanoseconds = decoder.read_u32()?;
     if nanoseconds > 999_999_999 {
         return Err(DecodeError::InvalidDiscriminant {
@@ -391,6 +391,7 @@ fn decode_set_attributes(decoder: &mut Decoder<'_>) -> Result<SetAttributes, Dec
         size: decoder.read_bool()?.then(|| decoder.read_u64()).transpose()?,
         access_time: decode_set_time(decoder)?,
         modify_time: decode_set_time(decoder)?,
+        acl: None,
     })
 }
 

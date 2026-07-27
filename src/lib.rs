@@ -1,47 +1,34 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
-#[cfg(feature = "demo")]
-mod context;
 pub mod rpc;
-#[cfg(feature = "demo")]
-mod rpcwire;
-#[cfg(feature = "demo")]
-mod write_counter;
-#[cfg(feature = "demo")]
-pub mod xdr;
-
-#[cfg(feature = "demo")]
-mod mount;
-#[cfg(feature = "demo")]
-mod mount_handlers;
 
 pub mod portmap;
-#[cfg(feature = "demo")]
-mod portmap_handlers;
-
-#[cfg(feature = "demo")]
-pub mod nfs;
-#[cfg(feature = "demo")]
-mod nfs_handlers;
 
 pub mod handles;
 pub mod mount3;
 pub mod nfs3;
+pub mod nfs4;
 pub mod observability;
 pub mod replay;
 pub mod server;
 
-#[cfg(all(feature = "demo", any(unix, windows)))]
-pub mod fs_util;
-
-#[cfg(feature = "demo")]
-pub mod tcp;
-#[cfg(feature = "demo")]
-mod transaction_tracker;
 pub mod vfs;
 
 pub use server::{
-    AuthPolicy, MountInfo, NfsServer, NfsServerBuilder, PortmapperMode, PortmapperSockets, ServerError, ServerHandle,
-    ServerLimits,
+    AuthPolicy, CallbackConnector, CallbackError, CallbackTarget, CallbackTransport, ChannelBindingError,
+    ChannelBindingProvider, DelegationPolicy, EndpointInfo, ExportConfig, FileHandlePolicy, FileSystemId,
+    KerberosCredentials, KeytabSource, MigrationBundle, MigrationBundleError, MigrationBundleLimits,
+    MigrationControlError, MigrationId, Nfs4Config, Nfs4Limits, Nfs4RecoveryMode, NfsServer, NfsServerBuilder,
+    NfsServerHandle, PortmapperSockets, ProtocolSet, RpcChannelBinding, RpcGssService, RpcSecurityFlavor,
+    SecurityPolicy, SecurityPolicyError, ServerError, ServerLimits, ServerSockets,
 };
-pub use vfs::{ExportId, Principal, RequestContext, VirtualFileSystem};
+pub use vfs::{
+    ChangeId, ChangeInfo, DelegationEligibility, DelegationKind, DelegationRequest, DelegationReservation, ExportId,
+    GssService, GssVersion, IdentityMapper, IdentityMappingError, MigrationCoordinator, MigrationError, MigrationFence,
+    Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4Capabilities, Nfs4FsLocation, Nfs4FsLocations, Nfs4IdentityMapper,
+    Nfs4LocationState, Nfs4MigrationCoordinator, Nfs4OpenAccess, Nfs4OpenCreate, Nfs4OpenExpectation,
+    Nfs4OpenPreflight, Nfs4OpenRequest, Nfs4OpenTarget, Nfs4Quota, Nfs4StableStateStore, NumericIdentityMapper,
+    PersistentObjectId, Principal, ProtocolVersion, RequestContext, SecurityContext, StableBatch, StableFenceToken,
+    StableKey, StableMutation, StableRecord, StableRecordKind, StableScope, StableSnapshot, StableStateError,
+    StableStateSession, StableStateStore, VirtualFileSystem,
+};

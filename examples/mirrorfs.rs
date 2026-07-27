@@ -24,7 +24,10 @@ use nfsembed::vfs::{
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
 #[cfg(feature = "demo")]
-use nfsembed::{AuthPolicy, NfsServer, PortmapperSockets};
+use nfsembed::{
+    AuthPolicy, ExportConfig, ExportId, FileHandlePolicy, FileSystemId, NfsServer, PortmapperSockets, ProtocolSet,
+    SecurityPolicy, ServerSockets,
+};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[cfg(feature = "demo")]
@@ -331,6 +334,7 @@ impl MirrorFs {
             .map(|metadata| metadata_to_attributes(parent.file_id, &metadata));
         Ok(MutationResult {
             value: created,
+            change_info: None,
             before,
             after,
         })
@@ -363,6 +367,7 @@ impl MirrorFs {
             .map(|metadata| metadata_to_attributes(parent.file_id, &metadata));
         Ok(MutationResult {
             value: (),
+            change_info: None,
             before,
             after,
         })
@@ -443,6 +448,7 @@ impl VirtualFileSystem for MirrorFs {
         let after_metadata = tokio::fs::symlink_metadata(&path).await.map_err(map_io_error)?;
         Ok(MutationResult {
             value: (),
+            change_info: None,
             before: Some(metadata_to_wcc(&before_metadata)),
             after: Some(metadata_to_attributes(file_id, &after_metadata)),
         })
@@ -528,6 +534,7 @@ impl VirtualFileSystem for MirrorFs {
                 count: u32::try_from(data.len()).unwrap_or(u32::MAX),
                 committed,
             },
+            change_info: None,
             before: Some(metadata_to_wcc(&before_metadata)),
             after: Some(metadata_to_attributes(file_id, &after_metadata)),
         })
@@ -615,11 +622,13 @@ impl VirtualFileSystem for MirrorFs {
         Ok((
             MutationResult {
                 value: (),
+                change_info: None,
                 before: from_before,
                 after: from_after,
             },
             MutationResult {
                 value: (),
+                change_info: None,
                 before: to_before,
                 after: to_after,
             },
@@ -747,6 +756,7 @@ impl VirtualFileSystem for MirrorFs {
         let after_metadata = tokio::fs::symlink_metadata(&path).await.map_err(map_io_error)?;
         Ok(MutationResult {
             value: (),
+            change_info: None,
             before: Some(metadata_to_wcc(&before_metadata)),
             after: Some(metadata_to_attributes(file_id, &after_metadata)),
         })
@@ -1045,7 +1055,7 @@ fn map_raw_os_error(error: i32) -> Option<NfsError> {
 #[cfg(unix)]
 fn metadata_time(seconds: i64, nanoseconds: i64) -> NfsTime {
     NfsTime {
-        seconds: seconds.max(0) as u64,
+        seconds,
         nanoseconds: nanoseconds.clamp(0, 999_999_999) as u32,
     }
 }
@@ -1054,7 +1064,7 @@ fn metadata_time(seconds: i64, nanoseconds: i64) -> NfsTime {
 fn metadata_time(time: SystemTime) -> NfsTime {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     NfsTime {
-        seconds: duration.as_secs(),
+        seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         nanoseconds: duration.subsec_nanos(),
     }
 }
@@ -1144,6 +1154,7 @@ fn metadata_to_attributes(file_id: u64, metadata: &Metadata) -> FileAttributes {
         device: None,
         fs_id,
         file_id,
+        change_id: file_id.into(),
         access_time,
         modify_time,
         change_time,
@@ -1154,6 +1165,7 @@ fn metadata_to_wcc(metadata: &Metadata) -> WccAttributes {
     let (_, _, _, _, _, _, _, modify_time, change_time) = metadata_platform_attributes(metadata);
     WccAttributes {
         size: metadata.len(),
+        change_id: 0.into(),
         modify_time,
         change_time,
     }
@@ -1401,6 +1413,8 @@ mod tests {
             principal: Principal::Anonymous,
             client_addr: "127.0.0.1:1".parse().unwrap(),
             export_id: ExportId(1),
+            protocol: nfsembed::vfs::ProtocolVersion::V3,
+            client_id: None,
         };
         let name = NfsName::new(b"link.txt".to_vec()).unwrap();
         let object = fs.lookup(&context, fs.root(), &name).await.unwrap().object;
@@ -1427,13 +1441,16 @@ mod tests {
 fn set_time_to_file_time(time: SetTime) -> filetime::FileTime {
     match time {
         SetTime::ServerTime => filetime::FileTime::now(),
-        SetTime::ClientTime(time) => filetime::FileTime::from_unix_time(time.seconds as i64, time.nanoseconds),
+        SetTime::ClientTime(time) => filetime::FileTime::from_unix_time(time.seconds, time.nanoseconds),
     }
 }
 
 #[cfg(feature = "demo")]
 #[allow(dead_code)]
 const HOST_PORT: u16 = 11111;
+#[cfg(feature = "demo")]
+#[allow(dead_code)]
+const MOUNT_PORT: u16 = 11112;
 
 #[cfg(feature = "demo")]
 #[allow(dead_code)]
@@ -1449,24 +1466,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("mirror root must be a directory".into());
     }
     let listener = TcpListener::bind(("127.0.0.1", HOST_PORT)).await?;
-    let server = NfsServer::builder(MirrorFs::new(root))
+    let mount_listener = TcpListener::bind(("127.0.0.1", MOUNT_PORT)).await?;
+    let server = NfsServer::builder(ProtocolSet::V3)
+        .add_export_owned(
+            ExportConfig::new(
+                ExportId(1),
+                "/",
+                FileSystemId::new(0x4e46_5345, 1),
+                SecurityPolicy::auth_sys(),
+                FileHandlePolicy::Volatile,
+            ),
+            MirrorFs::new(root),
+        )
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
     if let Ok(address) = std::env::var("NFSEMBED_PORTMAPPER") {
         let portmapper_tcp = TcpListener::bind(address).await?;
         let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
         server
-            .serve_with_portmapper(
-                listener,
-                PortmapperSockets::new(portmapper_tcp, portmapper_udp),
+            .serve(
+                ServerSockets::new(listener)
+                    .with_mount_listener(mount_listener)
+                    .with_portmapper(PortmapperSockets::new(portmapper_tcp, portmapper_udp)),
                 std::future::pending(),
             )
             .await?;
     } else {
-        server.serve(listener, std::future::pending()).await?;
+        server
+            .serve(ServerSockets::new(listener).with_mount_listener(mount_listener), std::future::pending())
+            .await?;
     }
     Ok(())
 }
 
 // Test with:
-// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
+// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11112,soft 127.0.0.1:/ mnt/

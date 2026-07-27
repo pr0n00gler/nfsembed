@@ -1,9 +1,9 @@
 [package]
 name = "nfsembed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.96"
-description = "A Rust NFS Server implementation"
+description = "An embeddable Rust NFSv3 and NFSv4.0 server"
 homepage = "https://github.com/pr0n00gler/nfsembed"
 repository = "https://github.com/pr0n00gler/nfsembed"
 readme = "README.md"
@@ -11,41 +11,59 @@ keywords = ["nfs"]
 license = "BSD-3-Clause"
 categories = ["network-programming", "filesystem"]
 publish = true
-include = ["src/**/*", "src/*", "examples/**/*", "tests/**/*", "benches/**/*", "Cargo.toml", "LICENSE", "README.md"]
+include = [
+    "src/**/*",
+    "src/*",
+    "examples/**/*",
+    "tests/**/*",
+    "benches/**/*",
+    "fuzz/Cargo.lock",
+    "fuzz/Cargo.toml",
+    "fuzz/README.md",
+    "fuzz/fuzz_targets/**/*",
+    "tools/**/*",
+    "vendor/**/*",
+    ".dockerignore",
+    "Cargo.toml",
+    "Cargo.lock",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "Makefile",
+    "MIGRATION.md",
+    "README.md",
+    "compose.yaml",
+]
 
 
 [lib]
 doctest = false
 
 [dependencies]
-byteorder = "1.4"
-num-traits = "0.2"
-num-derive = "0.4"
 tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros", "time"], default-features = false }
 tracing = "0.1.31"
-anyhow = "1"
 async-trait = "0.1.9"
 filetime = "0.2"
 bytes = "1"
 hmac = "0.12"
+picky-krb = "0.12"
 rand = "0.8"
 sha2 = "0.10"
+sspi = { version = "=0.21.3", default-features = false }
 thiserror = "1"
+tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 
-# demo
-tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
-intaglio = { version = "1.6", optional = true }
-
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
+sspi = { version = "=0.21.3", default-features = false, features = ["__test-data"] }
+tokio = { version = "1", features = ["test-util"], default-features = false }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [features]
 strict = []
-demo = ["tracing-subscriber", "tokio/rt-multi-thread", "intaglio"]
+demo = ["tracing-subscriber", "tokio/rt-multi-thread"]
 
 
 [[example]]

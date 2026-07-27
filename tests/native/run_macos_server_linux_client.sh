@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$root"
-cargo run --quiet --example certification_server -- "0.0.0.0:0" "$ready_file" "$shutdown_file" \
+cargo run --locked --quiet --example certification_server -- "0.0.0.0:0" "$ready_file" "$shutdown_file" \
   >"$server_log" 2>&1 &
 server_pid=$!
 
@@ -30,12 +30,13 @@ while [ ! -s "$ready_file" ]; do
   fi
   sleep 0.1
 done
+read -r server_port mount_port <"$ready_file"
 
 docker build -t nfsembed-native-linux -f "$root/tests/native/Dockerfile" "$root"
 if ! docker run --rm --privileged \
   -v "$root:/work" \
   nfsembed-native-linux \
-  ./tests/native/client.sh host.docker.internal "$(cat "$ready_file")"; then
+  ./tests/native/client.sh host.docker.internal "$server_port" read-write "$mount_port"; then
   cat "$server_log" >&2
   exit 1
 fi

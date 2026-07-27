@@ -50,6 +50,27 @@ pub enum FileType {
     Symlink,
     Socket,
     Fifo,
+    /// The virtual directory returned by NFSv4 OPENATTR.
+    AttributeDirectory,
+    /// A byte-stream object stored in an NFSv4 named-attribute directory.
+    NamedAttribute,
+}
+
+impl FileType {
+    /// Whether NFSv4 defines this object as a directory.
+    pub const fn is_directory(self) -> bool {
+        matches!(self, Self::Directory | Self::AttributeDirectory)
+    }
+
+    /// Whether NFSv4 defines this object as a regular byte-stream file.
+    pub const fn is_regular(self) -> bool {
+        matches!(self, Self::Regular | Self::NamedAttribute)
+    }
+
+    /// Whether this object belongs to the NFSv4 named-attribute namespace.
+    pub const fn is_named_attribute(self) -> bool {
+        matches!(self, Self::AttributeDirectory | Self::NamedAttribute)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,8 +81,33 @@ pub struct DeviceNumber {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NfsTime {
-    pub seconds: u64,
+    /// Seconds relative to the Unix epoch.
+    ///
+    /// NFSv4 uses a signed 64-bit value here. NFSv3 only has an unsigned
+    /// 32-bit seconds field; the v3 encoder rejects values outside that wire
+    /// range.
+    pub seconds: i64,
     pub nanoseconds: u32,
+}
+
+/// An authoritative, monotonically changing value for one filesystem object.
+///
+/// Backends may use an inode generation, metadata transaction number, or
+/// another opaque value. The server compares change IDs for equality and does
+/// not assign ordering semantics to them.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChangeId(pub u64);
+
+impl From<u64> for ChangeId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<ChangeId> for u64 {
+    fn from(value: ChangeId) -> Self {
+        value.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +124,8 @@ pub struct FileAttributes {
     pub device: Option<DeviceNumber>,
     pub fs_id: u64,
     pub file_id: u64,
+    /// Authoritative value for the NFSv4 `change` attribute.
+    pub change_id: ChangeId,
     pub access_time: NfsTime,
     pub modify_time: NfsTime,
     pub change_time: NfsTime,
@@ -91,6 +139,9 @@ pub struct SetAttributes {
     pub size: Option<u64>,
     pub access_time: Option<SetTime>,
     pub modify_time: Option<SetTime>,
+    /// Canonical NFSv4 ACL to apply atomically with mode inheritance and
+    /// synchronization. NFSv3 decoders always leave this unset.
+    pub acl: Option<Nfs4Acl>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,17 +151,70 @@ pub enum SetTime {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Nfs4AceType {
+    Allow,
+    Deny,
+    Audit,
+    Alarm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nfs4Ace {
+    pub ace_type: Nfs4AceType,
+    pub flags: u32,
+    pub mask: u32,
+    pub who: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Nfs4Acl {
+    pub entries: Vec<Nfs4Ace>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WccAttributes {
     pub size: u64,
+    /// Authoritative value captured with the weak-cache-consistency data.
+    pub change_id: ChangeId,
     pub modify_time: NfsTime,
     pub change_time: NfsTime,
+}
+
+/// Before/after change values returned by directory-modifying NFSv4
+/// operations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChangeInfo {
+    pub atomic: bool,
+    pub before: ChangeId,
+    pub after: ChangeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationResult<T> {
     pub value: T,
+    /// Protocol-neutral change information for the object whose namespace
+    /// was modified. NFSv4 namespace operations require this field; it is
+    /// deliberately independent of the optional NFSv3 WCC snapshots below.
+    pub change_info: Option<ChangeInfo>,
+    /// Optional NFSv3 weak-cache-consistency state captured before the
+    /// mutation.
     pub before: Option<WccAttributes>,
+    /// Optional NFSv3 weak-cache-consistency state captured after the
+    /// mutation.
     pub after: Option<FileAttributes>,
+}
+
+impl<T> MutationResult<T> {
+    /// Constructs a result without protocol-specific cache-consistency
+    /// metadata.
+    pub fn without_metadata(value: T) -> Self {
+        Self {
+            value,
+            change_info: None,
+            before: None,
+            after: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +235,14 @@ pub enum WriteStability {
     Unstable,
     DataSync,
     FileSync,
+}
+
+impl WriteStability {
+    /// Returns whether this achieved durability satisfies `requested`.
+    pub const fn satisfies(self, requested: Self) -> bool {
+        use WriteStability::{DataSync, FileSync, Unstable};
+        matches!((self, requested), (FileSync, _) | (DataSync, DataSync | Unstable) | (Unstable, Unstable))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,5 +413,15 @@ mod tests {
             attributes: None,
         });
         assert_eq!(result.data.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn write_stability_orders_achieved_durability() {
+        assert!(WriteStability::Unstable.satisfies(WriteStability::Unstable));
+        assert!(!WriteStability::Unstable.satisfies(WriteStability::DataSync));
+        assert!(!WriteStability::DataSync.satisfies(WriteStability::FileSync));
+        assert!(WriteStability::DataSync.satisfies(WriteStability::Unstable));
+        assert!(WriteStability::FileSync.satisfies(WriteStability::DataSync));
+        assert!(WriteStability::FileSync.satisfies(WriteStability::FileSync));
     }
 }

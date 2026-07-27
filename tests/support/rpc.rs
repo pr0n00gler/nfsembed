@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nfsembed::rpc::codec::{Decoder, Encoder};
 use nfsembed::rpc::record::{read_record, write_record, RecordLimits};
-use nfsembed::server::{AuthPolicy, NfsServer, PortmapperMode, ServerHandle, ServerLimits};
-use nfsembed::vfs::VirtualFileSystem;
-use tokio::io::AsyncWriteExt;
+use nfsembed::server::{
+    AuthPolicy, ExportConfig, FileHandlePolicy, FileSystemId, NfsServer, NfsServerHandle, ProtocolSet, SecurityPolicy,
+    ServerLimits, ServerSockets,
+};
+use nfsembed::vfs::{ExportId, VirtualFileSystem};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub const NFS_PROGRAM: u32 = 100_003;
@@ -52,15 +56,26 @@ impl RpcOutcome {
 }
 
 pub struct RpcClient {
-    stream: TcpStream,
+    address: SocketAddr,
+    stream: Option<TcpStream>,
+    mount_address: Option<SocketAddr>,
     next_xid: u32,
     auth: Auth,
 }
 
+static MOUNT_ENDPOINTS: OnceLock<Mutex<HashMap<SocketAddr, SocketAddr>>> = OnceLock::new();
+
+fn mount_endpoints() -> &'static Mutex<HashMap<SocketAddr, SocketAddr>> {
+    MOUNT_ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl RpcClient {
     pub async fn connect(address: SocketAddr) -> Self {
+        let mount_address = mount_endpoints().lock().unwrap().get(&address).copied();
         Self {
-            stream: TcpStream::connect(address).await.unwrap(),
+            address,
+            stream: None,
+            mount_address,
             next_xid: 1,
             auth: Auth::Sys,
         }
@@ -85,8 +100,7 @@ impl RpcClient {
         arguments: &[u8],
     ) -> RpcOutcome {
         let request = rpc_call(xid, 2, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
-        self.read_reply().await
+        self.exchange(program, &request).await
     }
 
     pub async fn call_with_rpc_version(
@@ -99,8 +113,7 @@ impl RpcClient {
         arguments: &[u8],
     ) -> RpcOutcome {
         let request = rpc_call(xid, rpc_version, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
-        self.read_reply().await
+        self.exchange(program, &request).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -125,8 +138,7 @@ impl RpcClient {
             verifier_flavor,
             verifier,
         );
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
-        self.read_reply().await
+        self.exchange(program, &request).await
     }
 
     pub async fn send_without_reading(
@@ -138,49 +150,93 @@ impl RpcClient {
         arguments: &[u8],
     ) {
         let request = rpc_call(xid, 2, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
+        let stream = self.nfs_stream().await;
+        write_record(&mut *stream, &request, 1024 * 1024).await.unwrap();
     }
 
     pub async fn read_reply(&mut self) -> RpcOutcome {
-        let record = read_record(&mut self.stream, RECORD_LIMITS).await.unwrap();
+        let record = read_record(self.nfs_stream().await, RECORD_LIMITS).await.unwrap();
         parse_reply(&record)
     }
 
+    async fn exchange(&mut self, program: u32, request: &[u8]) -> RpcOutcome {
+        if program == MOUNT_PROGRAM {
+            let address = self.mount_address.unwrap_or(self.address);
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            write_record(&mut stream, request, 1024 * 1024).await.unwrap();
+            let record = read_record(&mut stream, RECORD_LIMITS).await.unwrap();
+            // MOUNT calls use a fresh connection. Complete the TCP close
+            // handshake before returning so connection-limit tests do not
+            // race the server task that owns the released permit.
+            stream.shutdown().await.unwrap();
+            let mut eof = [0_u8; 1];
+            assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
+            parse_reply(&record)
+        } else {
+            let stream = self.nfs_stream().await;
+            write_record(&mut *stream, request, 1024 * 1024).await.unwrap();
+            let record = read_record(&mut *stream, RECORD_LIMITS).await.unwrap();
+            parse_reply(&record)
+        }
+    }
+
+    async fn nfs_stream(&mut self) -> &mut TcpStream {
+        if self.stream.is_none() {
+            self.stream = Some(TcpStream::connect(self.address).await.unwrap());
+        }
+        self.stream.as_mut().unwrap()
+    }
+
     pub async fn write_raw(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).await.unwrap();
+        self.nfs_stream().await.write_all(bytes).await.unwrap();
     }
 
     pub fn into_stream(self) -> TcpStream {
-        self.stream
+        self.stream.expect("NFS connection was never opened")
     }
 }
 
 pub struct RunningServer {
-    pub handle: ServerHandle,
+    pub handle: NfsServerHandle,
     pub address: SocketAddr,
+    pub mount_address: Option<SocketAddr>,
 }
 
 impl RunningServer {
     pub async fn shutdown(self) {
+        mount_endpoints().lock().unwrap().remove(&self.address);
         self.handle.shutdown().await.unwrap();
         self.handle.wait().await.unwrap();
     }
 }
 
 pub async fn start_server(vfs: Arc<dyn VirtualFileSystem>) -> RunningServer {
-    start_server_with(vfs, ServerLimits::production_defaults(), AuthPolicy::AuthSys, PortmapperMode::Disabled).await
+    start_server_with(vfs, ServerLimits::production_defaults(), AuthPolicy::AuthSys).await
 }
 
 pub async fn start_server_with(
     vfs: Arc<dyn VirtualFileSystem>,
     limits: ServerLimits,
     auth_policy: AuthPolicy,
-    portmapper: PortmapperMode,
 ) -> RunningServer {
-    let server = NfsServer::builder_arc(vfs)
+    let security_policy = match auth_policy {
+        AuthPolicy::AuthSys => SecurityPolicy::auth_sys(),
+        AuthPolicy::Anonymous => SecurityPolicy::anonymous(),
+        AuthPolicy::AuthSysOrAnonymous => SecurityPolicy::auth_sys_or_anonymous(),
+    };
+    let server = NfsServer::builder(ProtocolSet::V3)
+        .add_export(
+            ExportConfig::new(
+                ExportId(1),
+                "/",
+                FileSystemId::new(0x4e46_5345, 1),
+                security_policy,
+                FileHandlePolicy::Volatile,
+            ),
+            vfs,
+        )
         .limits(limits)
         .auth_policy(auth_policy)
-        .portmapper(portmapper)
         .build()
         .unwrap();
     start_built_server(server).await
@@ -188,9 +244,25 @@ pub async fn start_server_with(
 
 pub async fn start_built_server(server: NfsServer) -> RunningServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let handle = server.start(listener).await.unwrap();
-    let address = handle.mount_info().server_addr;
-    RunningServer { handle, address }
+    let sockets = if server.protocols().includes_v3() {
+        ServerSockets::new(listener).with_mount_listener(TcpListener::bind("127.0.0.1:0").await.unwrap())
+    } else {
+        ServerSockets::new(listener)
+    };
+    let handle = server.start(sockets).await.unwrap();
+    let address = handle.endpoint_info().address;
+    let mount_address = handle
+        .endpoint_info()
+        .mount_port
+        .map(|port| SocketAddr::new(address.ip(), port));
+    if let Some(mount_address) = mount_address {
+        mount_endpoints().lock().unwrap().insert(address, mount_address);
+    }
+    RunningServer {
+        handle,
+        address,
+        mount_address,
+    }
 }
 
 pub fn rpc_call(

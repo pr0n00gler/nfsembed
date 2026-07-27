@@ -2,26 +2,25 @@ use bytes::{Bytes, BytesMut};
 
 static XDR_PADDING: [u8; 3] = [0; 3];
 
-/// An encoded RPC reply that can retain a large opaque payload without
-/// copying it into the protocol prefix. Cloning a reply is always shallow.
+/// An encoded RPC reply composed of immutable buffers in wire order.
+///
+/// NFSv4 COMPOUND replies may contain more than one large READ payload, so a
+/// reply cannot be represented as only `prefix + payload + padding`. Cloning
+/// a reply remains shallow regardless of the number of segments.
 #[derive(Clone, Debug)]
 pub struct EncodedReply {
-    storage: ReplyStorage,
+    segments: Vec<Bytes>,
+    len: usize,
     // `Some` means the complete backing allocation is known and safe to
     // charge directly to the replay cache. Unknown `Bytes` owners must first
     // be compacted because a short slice can pin a much larger allocation.
     retained_bytes: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
-enum ReplyStorage {
-    Contiguous(Bytes),
-    Segmented {
-        prefix: Bytes,
-        payload: Bytes,
-        padding: usize,
-        len: usize,
-    },
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReplyBuildError {
+    #[error("encoded RPC reply length overflow")]
+    LengthOverflow,
 }
 
 impl EncodedReply {
@@ -29,28 +28,35 @@ impl EncodedReply {
     /// as separate buffers. `padding` is the trailing XDR padding byte count.
     pub fn segmented(prefix: Bytes, payload: Bytes, padding: usize) -> Self {
         assert!(padding <= XDR_PADDING.len());
-        let len = prefix
-            .len()
-            .checked_add(payload.len())
-            .and_then(|len| len.checked_add(padding))
-            .expect("validated RPC reply length");
-        Self {
-            storage: ReplyStorage::Segmented {
-                prefix,
-                payload,
-                padding,
-                len,
-            },
-            retained_bytes: None,
+        let mut segments = Vec::with_capacity(if padding == 0 { 2 } else { 3 });
+        segments.push(prefix);
+        segments.push(payload);
+        if padding != 0 {
+            segments.push(Bytes::from_static(&XDR_PADDING).slice(..padding));
         }
+        Self::try_from_segments(segments).expect("validated RPC reply length")
+    }
+
+    /// Creates a reply from an arbitrary number of immutable wire segments.
+    ///
+    /// Empty segments are retained so callers can keep stable segment
+    /// positions while constructing a reply. The transport skips them.
+    pub fn try_from_segments(segments: impl IntoIterator<Item = Bytes>) -> Result<Self, ReplyBuildError> {
+        let segments: Vec<_> = segments.into_iter().collect();
+        let len = segments
+            .iter()
+            .try_fold(0usize, |len, segment| len.checked_add(segment.len()))
+            .ok_or(ReplyBuildError::LengthOverflow)?;
+        Ok(Self {
+            segments,
+            len,
+            retained_bytes: None,
+        })
     }
 
     /// Returns the encoded wire length, including XDR padding.
     pub fn len(&self) -> usize {
-        match &self.storage {
-            ReplyStorage::Contiguous(bytes) => bytes.len(),
-            ReplyStorage::Segmented { len, .. } => *len,
-        }
+        self.len
     }
 
     /// Returns whether the encoded wire representation is empty.
@@ -59,24 +65,18 @@ impl EncodedReply {
     }
 
     /// Returns the immutable buffers in wire order for vectored transport.
-    pub fn segments(&self) -> [&[u8]; 3] {
-        match &self.storage {
-            ReplyStorage::Contiguous(bytes) => [bytes, &[], &[]],
-            ReplyStorage::Segmented {
-                prefix,
-                payload,
-                padding,
-                ..
-            } => [prefix, payload, &XDR_PADDING[..*padding]],
-        }
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.segments.iter().map(Bytes::as_ref)
+    }
+
+    /// Returns the number of immutable buffers in the encoded reply.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 
     /// Returns the protocol prefix used for status extraction and tracing.
     pub fn prefix(&self) -> &[u8] {
-        match &self.storage {
-            ReplyStorage::Contiguous(bytes) => bytes,
-            ReplyStorage::Segmented { prefix, .. } => prefix,
-        }
+        self.segments.first().map_or(&[], Bytes::as_ref)
     }
 
     pub(crate) fn replay_storage_requires_copy(&self) -> bool {
@@ -92,67 +92,44 @@ impl EncodedReply {
             return (self.clone(), retained_bytes);
         }
 
-        match &self.storage {
-            ReplyStorage::Contiguous(bytes) => {
-                let (bytes, retained_bytes) = compact_bytes(bytes);
-                (
-                    Self {
-                        storage: ReplyStorage::Contiguous(bytes),
-                        retained_bytes: Some(retained_bytes),
-                    },
-                    retained_bytes,
-                )
-            },
-            ReplyStorage::Segmented {
-                prefix,
-                payload,
-                padding,
-                len,
-            } => {
-                let (prefix, prefix_bytes) = compact_bytes(prefix);
-                let (payload, payload_bytes) = compact_bytes(payload);
-                let retained_bytes = (*len).max(prefix_bytes.saturating_add(payload_bytes));
-                (
-                    Self {
-                        storage: ReplyStorage::Segmented {
-                            prefix,
-                            payload,
-                            padding: *padding,
-                            len: *len,
-                        },
-                        retained_bytes: Some(retained_bytes),
-                    },
-                    retained_bytes,
-                )
-            },
+        let mut compacted = Vec::with_capacity(self.segments.len());
+        let mut retained_bytes = 0usize;
+        for segment in &self.segments {
+            let (segment, segment_bytes) = compact_bytes(segment);
+            retained_bytes = retained_bytes.saturating_add(segment_bytes);
+            compacted.push(segment);
         }
+        retained_bytes = retained_bytes.max(self.len);
+        (
+            Self {
+                segments: compacted,
+                len: self.len,
+                retained_bytes: Some(retained_bytes),
+            },
+            retained_bytes,
+        )
     }
 
     /// Coalesces the reply when a consumer specifically requires contiguous
     /// storage. The production transport writes `segments` directly.
     pub fn into_bytes(self) -> Bytes {
-        match self.storage {
-            ReplyStorage::Contiguous(bytes) => bytes,
-            ReplyStorage::Segmented {
-                prefix,
-                payload,
-                padding,
-                len,
-            } => {
-                let mut output = BytesMut::with_capacity(len);
-                for segment in [&prefix[..], &payload[..], &XDR_PADDING[..padding]] {
-                    output.extend_from_slice(segment);
-                }
-                output.freeze()
-            },
+        let mut segments = self.segments;
+        if segments.len() == 1 {
+            return segments.pop().expect("one reply segment");
         }
+        let mut output = BytesMut::with_capacity(self.len);
+        for segment in segments {
+            output.extend_from_slice(&segment);
+        }
+        output.freeze()
     }
 }
 
 impl From<Bytes> for EncodedReply {
     fn from(value: Bytes) -> Self {
         Self {
-            storage: ReplyStorage::Contiguous(value),
+            len: value.len(),
+            segments: vec![value],
             retained_bytes: None,
         }
     }
@@ -161,8 +138,10 @@ impl From<Bytes> for EncodedReply {
 impl From<Vec<u8>> for EncodedReply {
     fn from(value: Vec<u8>) -> Self {
         let retained_bytes = value.capacity();
+        let len = value.len();
         Self {
-            storage: ReplyStorage::Contiguous(Bytes::from(value)),
+            segments: vec![Bytes::from(value)],
+            len,
             retained_bytes: Some(retained_bytes),
         }
     }
@@ -180,8 +159,8 @@ impl PartialEq for EncodedReply {
         if self.len() != other.len() {
             return false;
         }
-        let mut left = self.segments().into_iter().flat_map(|segment| segment.iter());
-        let mut right = other.segments().into_iter().flat_map(|segment| segment.iter());
+        let mut left = self.segments().flat_map(|segment| segment.iter());
+        let mut right = other.segments().flat_map(|segment| segment.iter());
         left.by_ref().eq(right.by_ref())
     }
 }
@@ -190,7 +169,7 @@ impl Eq for EncodedReply {}
 
 impl PartialEq<Bytes> for EncodedReply {
     fn eq(&self, other: &Bytes) -> bool {
-        self.len() == other.len() && self.segments().into_iter().flat_map(|segment| segment.iter()).eq(other.iter())
+        self.len() == other.len() && self.segments().flat_map(|segment| segment.iter()).eq(other.iter())
     }
 }
 
@@ -213,7 +192,20 @@ mod tests {
         let pointer = value.as_ptr();
         let reply = EncodedReply::from(value);
         let (cached, retained_bytes) = reply.replay_storage();
-        assert_eq!(cached.segments()[0].as_ptr(), pointer);
+        assert_eq!(cached.segments().next().unwrap().as_ptr(), pointer);
         assert!(retained_bytes >= 1024);
+    }
+
+    #[test]
+    fn supports_multiple_read_payload_segments() {
+        let reply = EncodedReply::try_from_segments([
+            Bytes::from_static(b"rpc+compound"),
+            Bytes::from_static(b"read-one"),
+            Bytes::from_static(b"middle"),
+            Bytes::from_static(b"read-two"),
+        ])
+        .unwrap();
+        assert_eq!(reply.segment_count(), 4);
+        assert_eq!(reply.into_bytes(), Bytes::from_static(b"rpc+compoundread-onemiddleread-two"));
     }
 }

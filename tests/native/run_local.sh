@@ -53,28 +53,34 @@ wait_ready() {
 run_profile() {
   profile=$1
   client_mode=$2
-  current_profile=$profile
+  protocol=${3:-v3}
+  current_profile="$protocol/$profile"
   state_dir=$(mktemp -d "${TMPDIR:-/tmp}/nfsembed-native-state.XXXXXX")
   ready_file=$state_dir/ready
   shutdown_file=$state_dir/shutdown
   restart_file=$state_dir/restart
   server_log=$state_dir/server.log
 
-  cargo run --quiet --example certification_server -- \
+  NFSEMBED_PROTOCOL=$protocol cargo run --locked --quiet --example certification_server -- \
     "127.0.0.1:0" "$ready_file" "$shutdown_file" "$profile" "$restart_file" \
     >"$server_log" 2>&1 &
   server_pid=$!
   wait_ready "$ready_file"
-  server_port=$(cat "$ready_file")
+  read -r server_port mount_port <"$ready_file"
 
-  "$root/tests/native/client.sh" 127.0.0.1 "$server_port" "$client_mode"
+  if [ "$protocol" = "v4" ]; then
+    "$root/tests/native/client_nfs4.sh" 127.0.0.1 "$server_port"
+  else
+    "$root/tests/native/client.sh" 127.0.0.1 "$server_port" "$client_mode" "$mount_port"
+  fi
 
-  if [ "$profile" = "read-write" ]; then
-    "$root/tests/native/client.sh" 127.0.0.1 "$server_port" restart-prepare
+  if [ "$profile" = "read-write" ] && [ "$protocol" = "v3" ]; then
+    "$root/tests/native/client.sh" 127.0.0.1 "$server_port" restart-prepare "$mount_port"
     rm -f "$ready_file"
     : >"$restart_file"
     wait_ready "$ready_file"
-    "$root/tests/native/client.sh" 127.0.0.1 "$(cat "$ready_file")" restart-verify
+    read -r server_port mount_port <"$ready_file"
+    "$root/tests/native/client.sh" 127.0.0.1 "$server_port" restart-verify "$mount_port"
   fi
 
   : >"$shutdown_file"
@@ -95,3 +101,4 @@ run_profile read-write read-write
 run_profile lost-reply lost-reply
 run_profile read-only read-only
 run_profile case-insensitive case-insensitive
+run_profile read-write read-write v4
