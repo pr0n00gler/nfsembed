@@ -32,11 +32,11 @@ trap cleanup EXIT INT TERM
 mount_server() {
   case "$(uname -s)" in
     Darwin)
-      privileged mount_nfs -o "vers=4.0,tcp,port=$server_port" \
+      privileged mount_nfs -o "vers=4.0,tcp,port=$server_port,sec=sys" \
         "$server_host:$export_path" "$mount_dir"
       ;;
     Linux)
-      privileged mount -t nfs4 -o "vers=4.0,proto=tcp,port=$server_port" \
+      privileged mount -t nfs4 -o "vers=4.0,proto=tcp,port=$server_port,sec=sys" \
         "$server_host:$export_path" "$mount_dir"
       ;;
     *)

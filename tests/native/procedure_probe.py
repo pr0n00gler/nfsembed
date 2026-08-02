@@ -10,6 +10,7 @@ NFS_PROGRAM = 100003
 NFS_VERSION = 3
 MOUNT_PROGRAM = 100005
 MOUNT_VERSION = 3
+AUTH_SYS = 1
 
 
 def u32(value):
@@ -40,10 +41,10 @@ def read_opaque(data, offset):
 
 
 class RpcClient:
-    def __init__(self, host, port):
+    def __init__(self, host, port, initial_xid):
         self.socket = socket.create_connection((host, port), timeout=10)
         self.socket.settimeout(10)
-        self.xid = 1000
+        self.xid = initial_xid
 
     def close(self):
         self.socket.close()
@@ -69,6 +70,15 @@ class RpcClient:
 
     def call(self, program, version, procedure, arguments=b""):
         self.xid += 1
+        credential = b"".join(
+            [
+                u32(0),
+                opaque(b"nfsembed-certification"),
+                u32(0),
+                u32(0),
+                u32(0),
+            ]
+        )
         body = b"".join(
             [
                 u32(self.xid),
@@ -77,8 +87,8 @@ class RpcClient:
                 u32(program),
                 u32(version),
                 u32(procedure),
-                u32(0),
-                u32(0),
+                u32(AUTH_SYS),
+                opaque(credential),
                 u32(0),
                 u32(0),
                 arguments,
@@ -122,9 +132,9 @@ def mount_root(client):
     return root
 
 
-def verify_read_only(client):
-    root = mount_root(client)
-    lookup = client.call(NFS_PROGRAM, NFS_VERSION, 3, directory_operation(root, b"file"))
+def verify_read_only(mount_client, nfs_client):
+    root = mount_root(mount_client)
+    lookup = nfs_client.call(NFS_PROGRAM, NFS_VERSION, 3, directory_operation(root, b"file"))
     if status(lookup) != 0:
         raise RuntimeError(f"read-only LOOKUP returned status {status(lookup)}")
     file_handle, _offset = read_opaque(lookup, 4)
@@ -147,7 +157,7 @@ def verify_read_only(client):
         ("COMMIT", 21, handle + u64(0) + u32(0)),
     ]
     for name, procedure, arguments in mutations:
-        result = client.call(NFS_PROGRAM, NFS_VERSION, procedure, arguments)
+        result = nfs_client.call(NFS_PROGRAM, NFS_VERSION, procedure, arguments)
         result_status = status(result)
         if result_status != 30:
             raise RuntimeError(f"read-only {name} returned status {result_status}, expected 30")
@@ -155,36 +165,40 @@ def verify_read_only(client):
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
-        raise SystemExit("usage: procedure_probe.py SERVER_HOST SERVER_PORT [read-only]")
-    client = RpcClient(sys.argv[1], int(sys.argv[2]))
-    if len(sys.argv) == 4:
-        if sys.argv[3] != "read-only":
-            raise SystemExit(f"unknown probe profile: {sys.argv[3]}")
+    if len(sys.argv) not in (4, 5):
+        raise SystemExit("usage: procedure_probe.py SERVER_HOST NFS_PORT MOUNT_PORT [read-only]")
+    # The duplicate-request cache is scoped by client address and export, not
+    # by listener port, so MOUNT and NFS must use disjoint XID ranges.
+    mount_client = RpcClient(sys.argv[1], int(sys.argv[3]), 1000)
+    nfs_client = RpcClient(sys.argv[1], int(sys.argv[2]), 100000)
+    if len(sys.argv) == 5:
+        if sys.argv[4] != "read-only":
+            raise SystemExit(f"unknown probe profile: {sys.argv[4]}")
         try:
-            verify_read_only(client)
+            verify_read_only(mount_client, nfs_client)
         finally:
-            client.close()
+            mount_client.close()
+            nfs_client.close()
         return
     nfs_covered = set()
     mount_covered = set()
     try:
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 0)
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 0)
         mount_covered.add(0)
-        mount_reply = client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, opaque(b"/"))
+        mount_reply = mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, opaque(b"/"))
         mount_covered.add(1)
         status, offset = read_u32(mount_reply, 0)
         if status != 0:
             raise RuntimeError(f"MOUNT returned status {status}")
         root, _offset = read_opaque(mount_reply, offset)
 
-        wrong_case = client.call(NFS_PROGRAM, NFS_VERSION, 3, directory_operation(root, b"FiLe"))
+        wrong_case = nfs_client.call(NFS_PROGRAM, NFS_VERSION, 3, directory_operation(root, b"FiLe"))
         wrong_case_status, _offset = read_u32(wrong_case, 0)
         if wrong_case_status != 2:
             raise RuntimeError(f"case-sensitive LOOKUP returned status {wrong_case_status}, expected 2")
 
         def nfs(procedure, arguments=b""):
-            payload = client.call(NFS_PROGRAM, NFS_VERSION, procedure, arguments)
+            payload = nfs_client.call(NFS_PROGRAM, NFS_VERSION, procedure, arguments)
             if procedure != 0 and len(payload) < 4:
                 raise RuntimeError(f"NFS procedure {procedure} returned a truncated result")
             nfs_covered.add(procedure)
@@ -222,14 +236,14 @@ def main():
         nfs(12, directory_operation(root, b"probe-fifo"))
         nfs(13, directory_operation(root, b"probe-dir"))
 
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 2)
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 2)
         mount_covered.add(2)
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 5)
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 5)
         mount_covered.add(5)
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 3, opaque(b"/"))
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 3, opaque(b"/"))
         mount_covered.add(3)
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, opaque(b"/"))
-        client.call(MOUNT_PROGRAM, MOUNT_VERSION, 4)
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 1, opaque(b"/"))
+        mount_client.call(MOUNT_PROGRAM, MOUNT_VERSION, 4)
         mount_covered.add(4)
 
         if nfs_covered != set(range(22)):
@@ -238,7 +252,8 @@ def main():
             raise RuntimeError(f"incomplete MOUNT procedure coverage: {sorted(mount_covered)}")
         print("covered NFSv3 procedures 0-21 and MOUNTv3 procedures 0-5")
     finally:
-        client.close()
+        mount_client.close()
+        nfs_client.close()
 
 
 if __name__ == "__main__":

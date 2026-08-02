@@ -30,7 +30,7 @@ trap cleanup EXIT INT TERM
 mount_server() {
   case "$(uname -s)" in
     Darwin)
-      mount_options="vers=3,tcp,port=$server_port,mountport=$mount_port,nolocks"
+      mount_options="vers=3,tcp,port=$server_port,mountport=$mount_port,nolocks,sec=sys"
       if [ "$profile" = "lost-reply" ]; then
         mount_options="$mount_options,soft"
       fi
@@ -38,7 +38,7 @@ mount_server() {
         "$server_host:/" "$mount_dir"
       ;;
     Linux)
-      mount_options="vers=3,mountvers=3,tcp,port=$server_port,mountport=$mount_port,nolock"
+      mount_options="vers=3,mountvers=3,tcp,port=$server_port,mountport=$mount_port,nolock,sec=sys"
       if [ "$profile" = "lost-reply" ]; then
         mount_options="$mount_options,soft,timeo=20,retrans=3"
       fi
@@ -63,7 +63,7 @@ mount_server
 case "$profile" in
   read-only)
     "$root/tests/run_python_entrypoint.sh" \
-      tests/native/procedure_probe.py "$server_host" "$server_port" read-only
+      tests/native/procedure_probe.py "$server_host" "$server_port" "$mount_port" read-only
     test -f "$mount_dir/file"
     dd if="$mount_dir/file" of=/dev/null bs=131072 >/dev/null 2>&1
     original_checksum=$(cksum <"$mount_dir/file")
@@ -113,7 +113,7 @@ case "$profile" in
     ;;
   read-write)
     "$root/tests/run_python_entrypoint.sh" \
-      tests/native/procedure_probe.py "$server_host" "$server_port"
+      tests/native/procedure_probe.py "$server_host" "$server_port" "$mount_port"
     ls -la "$mount_dir" >/dev/null
     test -f "$mount_dir/file"
     if test -e "$mount_dir/FiLe"; then

@@ -5534,19 +5534,8 @@ fn canonical_client_identity(principal: &Principal) -> Vec<u8> {
     let mut value = Vec::new();
     match principal {
         Principal::Anonymous => value.push(0),
-        Principal::AuthSys {
-            uid,
-            gid,
-            supplementary_gids,
-            machine_name,
-        } => {
+        Principal::AuthSys { machine_name, .. } => {
             value.push(1);
-            value.extend_from_slice(&uid.to_be_bytes());
-            value.extend_from_slice(&gid.to_be_bytes());
-            value.extend_from_slice(&(supplementary_gids.len() as u32).to_be_bytes());
-            for group in supplementary_gids {
-                value.extend_from_slice(&group.to_be_bytes());
-            }
             value.extend_from_slice(&(machine_name.len() as u32).to_be_bytes());
             value.extend_from_slice(machine_name);
         },
@@ -5569,10 +5558,22 @@ fn canonical_client_identity(principal: &Principal) -> Vec<u8> {
 /// exact RPC authentication flavor used for an individual operation.
 ///
 /// A GSS canonical name and mechanism identify one Kerberos client across
-/// RPCSEC_GSS versions and krb5/krb5i/krb5p service levels. AUTH_NONE and
-/// AUTH_SYS remain exact to avoid broadening weaker identities.
+/// RPCSEC_GSS versions and krb5/krb5i/krb5p service levels. AUTH_SYS uses
+/// the caller's machine name because one NFS client ID is shared by every
+/// local user while their uid, gid, and supplementary groups remain the
+/// credentials for authorizing each individual operation.
 fn same_client_identity(stored: &Principal, presented: &Principal) -> bool {
     match (stored, presented) {
+        (
+            Principal::AuthSys {
+                machine_name: stored_machine,
+                ..
+            },
+            Principal::AuthSys {
+                machine_name: presented_machine,
+                ..
+            },
+        ) => stored_machine == presented_machine,
         (
             Principal::Gss {
                 canonical_name: stored_name,
@@ -6931,6 +6932,70 @@ mod tests {
             Err(NfsStatus::Access)
         ));
         assert_eq!(runtime.validate_client(client_id, &other_principal).await, NfsStatus::StaleClientId);
+    }
+
+    #[tokio::test]
+    async fn auth_sys_client_identity_is_shared_by_users_on_the_same_machine() {
+        let runtime = Nfs4Runtime::new(config()).unwrap();
+        let machine_principal = Principal::AuthSys {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+            machine_name: b"linux-client".to_vec(),
+        };
+        let set = assert_no_releases(
+            runtime
+                .set_client_id(&set_client(b"auth-sys-client", [0x31; 8], b"127.0.0.1.8.1"), &machine_principal)
+                .await,
+        );
+        let SetClientIdResult::Ok(set) = set else {
+            panic!("AUTH_SYS SETCLIENTID did not succeed");
+        };
+        assert_eq!(
+            assert_no_releases(
+                runtime
+                    .confirm_client(set.client_id, set.confirmation, &machine_principal)
+                    .await
+            ),
+            NfsStatus::Ok
+        );
+
+        let user_principal = Principal::AuthSys {
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![27, 1000],
+            machine_name: b"linux-client".to_vec(),
+        };
+        assert_eq!(canonical_client_identity(&machine_principal), canonical_client_identity(&user_principal));
+        assert_eq!(runtime.validate_client(set.client_id, &user_principal).await, NfsStatus::Ok);
+
+        let owner = OpenOwner {
+            client_id: set.client_id,
+            owner: b"per-user-open-owner".to_vec(),
+        };
+        assert!(matches!(
+            runtime
+                .begin_open_with_identity(
+                    &owner,
+                    0,
+                    ShareAccess::READ.bits(),
+                    ShareDeny::NONE.bits(),
+                    false,
+                    true,
+                    OwnerRequestDigest([0x32; 32]),
+                    &user_principal,
+                )
+                .await,
+            OpenDecision::Execute(_)
+        ));
+
+        let other_machine = Principal::AuthSys {
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![27, 1000],
+            machine_name: b"different-client".to_vec(),
+        };
+        assert_eq!(runtime.validate_client(set.client_id, &other_machine).await, NfsStatus::StaleClientId);
     }
 
     #[tokio::test]

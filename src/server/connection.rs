@@ -548,7 +548,7 @@ async fn dispatch_record(
 
     let request_export_id = request_export_id(program, procedure, &arguments, &state);
     if program != crate::portmap::PROGRAM
-        && !principal_allowed_for_call(&state, program, version, request_export_id, &principal)
+        && !principal_allowed_for_call(&state, program, version, procedure, request_export_id, &principal)
     {
         return Ok(Some(auth_error(xid, 5).into()));
     }
@@ -2371,9 +2371,16 @@ fn principal_allowed_for_call(
     state: &ConnectionState,
     program: u32,
     version: u32,
+    procedure: u32,
     export_id: ExportId,
     principal: &Principal,
 ) -> bool {
+    // Native clients probe the NFS endpoint with an AUTH_NONE NULL call
+    // before selecting one of the export's advertised security flavors.
+    // NULL has no arguments, result, or export access to authorize.
+    if program == crate::nfs3::types::PROGRAM && procedure == 0 {
+        return true;
+    }
     if program != crate::nfs4::PROGRAM {
         return principal_allowed(state.auth_policy, principal);
     }
@@ -2909,6 +2916,40 @@ mod reply_tests {
             alice,
             bob,
         }
+    }
+
+    #[tokio::test]
+    async fn auth_none_can_probe_nfs_null_but_cannot_access_an_auth_sys_export() {
+        let export = ExportConfig::new(
+            TEST_EXPORT_ID,
+            "/",
+            FileSystemId::new(1, 1),
+            SecurityPolicy::auth_sys(),
+            FileHandlePolicy::Volatile,
+        );
+        let server = NfsServer::builder(ProtocolSet::V3)
+            .add_export(export, Arc::new(ReplayWriteVfs::new()))
+            .auth_policy(AuthPolicy::AuthSysOrAnonymous)
+            .build()
+            .unwrap();
+        let (state, _executions, _) = server.connection_state().await.unwrap();
+
+        assert!(principal_allowed_for_call(
+            &state,
+            crate::nfs3::types::PROGRAM,
+            crate::nfs3::types::VERSION,
+            0,
+            ExportId(0),
+            &Principal::Anonymous,
+        ));
+        assert!(!principal_allowed_for_call(
+            &state,
+            crate::nfs3::types::PROGRAM,
+            crate::nfs3::types::VERSION,
+            1,
+            TEST_EXPORT_ID,
+            &Principal::Anonymous,
+        ));
     }
 
     async fn establish_test_context(

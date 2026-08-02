@@ -150,6 +150,28 @@ fn native_python_probe_is_container_routed_outside_ci() {
     assert!(windows.contains("script-runner"));
 }
 
+#[test]
+fn native_certification_uses_auth_sys_and_split_v3_endpoints() {
+    let server = read("examples/certification_server.rs");
+    let client = read("tests/native/client.sh");
+    let nfs4_client = read("tests/native/client_nfs4.sh");
+    let windows_client = read("tests/native/client_windows.ps1");
+    let windows_runner = read("tests/native/run_windows.ps1");
+    let probe = read("tests/native/procedure_probe.py");
+
+    assert!(server.contains("SecurityPolicy::auth_sys()"));
+    assert_eq!(client.matches("sec=sys").count(), 2);
+    assert_eq!(nfs4_client.matches("sec=sys").count(), 2);
+    assert!(windows_client.contains("sec=sys"));
+    assert!(!windows_client.contains("anon,"));
+    assert!(windows_runner.contains("$serverPorts.Mount"));
+    assert!(windows_runner.contains("[string]$mountPort"));
+    assert!(probe.contains("AUTH_SYS = 1"));
+    assert!(probe.contains("SERVER_HOST NFS_PORT MOUNT_PORT"));
+    assert!(probe.contains("mount_client"));
+    assert!(probe.contains("nfs_client"));
+}
+
 #[cfg(unix)]
 #[test]
 fn scripting_language_sources_are_not_host_executables() {

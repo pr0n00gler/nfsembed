@@ -35,7 +35,14 @@ function Wait-Ready([string]$ReadyFile, [System.Diagnostics.Process]$Process) {
         if (Test-Path -LiteralPath $ReadyFile) {
             $value = (Get-Content -LiteralPath $ReadyFile -Raw).Trim()
             if ($value) {
-                return [int](($value -split "\s+")[0])
+                $ports = @($value -split "\s+")
+                if ($ports.Count -ne 2) {
+                    throw "certification server readiness did not contain NFS and MOUNT ports: $value"
+                }
+                return [PSCustomObject]@{
+                    Nfs = [int]$ports[0]
+                    Mount = [int]$ports[1]
+                }
             }
         }
         if ($Process.HasExited) {
@@ -142,7 +149,9 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
     $null = $process.Handle
 
     try {
-        $serverPort = Wait-Ready $ready $process
+        $serverPorts = Wait-Ready $ready $process
+        $serverPort = $serverPorts.Nfs
+        $mountPort = $serverPorts.Mount
         Reset-NfsClient
         & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $client -ServerHost $ServerHost -Profile $ClientProfile -Drive $Drive
         if ($LASTEXITCODE -ne 0) {
@@ -152,7 +161,7 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
         if ($Profile -eq "read-write") {
             Invoke-PythonEntrypoint `
                 -RelativeScript "tests/native/procedure_probe.py" `
-                -ScriptArguments @($ServerHost, [string]$serverPort)
+                -ScriptArguments @($ServerHost, [string]$serverPort, [string]$mountPort)
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $client -ServerHost $ServerHost -Profile restart-prepare -Drive $Drive
             if ($LASTEXITCODE -ne 0) {
                 throw "restart preparation failed"
@@ -168,7 +177,7 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
         } elseif ($Profile -eq "read-only") {
             Invoke-PythonEntrypoint `
                 -RelativeScript "tests/native/procedure_probe.py" `
-                -ScriptArguments @($ServerHost, [string]$serverPort, "read-only")
+                -ScriptArguments @($ServerHost, [string]$serverPort, [string]$mountPort, "read-only")
         }
 
         Stop-CertificationServer $process $shutdown $stderr
