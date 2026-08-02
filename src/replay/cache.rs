@@ -397,12 +397,12 @@ mod tests {
         lease.complete(EncodedReply::segmented(Bytes::from_static(b"prefix"), payload, 2));
 
         let waited = waiter.await.unwrap().unwrap();
-        assert_eq!(waited.segments()[1].as_ptr(), payload_pointer);
+        assert_eq!(waited.segments().nth(1).unwrap().as_ptr(), payload_pointer);
         let replayed = match cache.begin(key(1), fingerprint).await.unwrap() {
             ReplayDecision::Replay(reply) => reply,
             _ => panic!("expected completed replay"),
         };
-        assert_ne!(replayed.segments()[1].as_ptr(), payload_pointer);
+        assert_ne!(replayed.segments().nth(1).unwrap().as_ptr(), payload_pointer);
         assert_eq!(cache.retained_bytes().await, 1032);
     }
 

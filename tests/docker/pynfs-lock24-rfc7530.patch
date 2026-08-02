@@ -1,0 +1,17 @@
+diff --git a/nfs4.0/servertests/st_lock.py b/nfs4.0/servertests/st_lock.py
+--- a/nfs4.0/servertests/st_lock.py
++++ b/nfs4.0/servertests/st_lock.py
+@@ -927,5 +927,12 @@ def testOpenUpgradeLock(t, env):
+     os.open(OPEN4_SHARE_ACCESS_WRITE)
+     os.unlock()
+     os.downgrade(OPEN4_SHARE_ACCESS_WRITE)
+-    os.lock(WRITE_LT)
++    # RFC 7530 section 16.10 requires BAD_SEQID when the new-lock-owner
++    # arm is used after byte-range locking state has already been created.
++    # The helper deliberately sends that arm again here; a correct server
++    # must not treat the empty lock range set as a new lock-owner.
++    res = c.lock_file(os.owner, os.fh, os.stateid,
++                      type=WRITE_LT, lockowner=os.lockowner,
++                      lockseqid=os.lockseqid)
++    check(res, NFS4ERR_BAD_SEQID)
+     os.close()

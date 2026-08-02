@@ -3,7 +3,7 @@ mod support;
 use std::sync::Arc;
 
 use nfsembed::rpc::codec::{Decoder, Encoder};
-use nfsembed::server::{AuthPolicy, PortmapperMode, ServerLimits};
+use nfsembed::server::{AuthPolicy, ServerLimits};
 use nfsembed::vfs::ExportId;
 use support::rpc::{
     auth_sys_body, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload, record_header, rpc_call, start_server,
@@ -23,7 +23,7 @@ async fn valid_rpc_call_survives_every_fragment_size() {
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
     let mut limits = ServerLimits::production_defaults();
     limits.max_fragments_per_record = 128;
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
 
     for fragment_size in 1..=96 {
@@ -82,7 +82,7 @@ async fn every_truncated_write_prefix_and_length_mismatch_is_rejected() {
     let mut limits = ServerLimits::production_defaults();
     limits.max_write_size = 16;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
     let file = lookup_handle(&mut client, &root, b"file").await;
@@ -140,7 +140,7 @@ async fn readdir_and_readdirplus_size_sweep_never_exceeds_client_limit() {
     let mut limits = ServerLimits::production_defaults();
     limits.max_readdir_response_size = 512;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
 

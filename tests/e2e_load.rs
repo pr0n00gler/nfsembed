@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nfsembed::rpc::codec::Encoder;
-use nfsembed::server::{AuthPolicy, PortmapperMode, ServerLimits};
+use nfsembed::server::{AuthPolicy, ServerLimits};
 use nfsembed::vfs::ExportId;
 use support::rpc::{mount_root, nfs_args_handle, nfs_payload, start_server_with, RpcClient, NFS_PROGRAM, NFS_VERSION};
 use support::vfs::ConformanceVfs;
@@ -34,16 +34,20 @@ async fn sustained_connections_requests_and_mutations_remain_bounded() {
     const REQUESTS_PER_CLIENT: usize = 100;
     const WRITES_PER_CLIENT: usize = REQUESTS_PER_CLIENT / 4;
     const MAX_INFLIGHT: usize = 8;
+    // The public test harness uses a dedicated MOUNTv3 connection before each
+    // client opens its long-lived NFS connection. Connection limits are
+    // server-wide, so allow the bounded transient overlap of both services.
+    const MAX_CONNECTIONS: usize = 2 * CLIENTS + 4;
     const MAX_RSS_GROWTH_KIB: u64 = 128 * 1024;
 
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
     vfs.delay("write", Duration::from_millis(1));
     let mut limits = ServerLimits::production_defaults();
-    limits.max_connections = CLIENTS + 4;
+    limits.max_connections = MAX_CONNECTIONS;
     limits.max_requests_per_connection = 4;
     limits.max_inflight_requests = MAX_INFLIGHT;
     limits.replay_cache_capacity = CLIENTS * REQUESTS_PER_CLIENT * 2;
-    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys).await;
     let barrier = Arc::new(Barrier::new(CLIENTS));
     let memory_before = resident_memory_kib();
     let started = Instant::now();

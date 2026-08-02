@@ -9,10 +9,10 @@ restart=${5:-}
 
 cd "$repository" || exit 125
 if [ -n "$restart" ]; then
-  "$HOME/.cargo/bin/cargo" run --quiet --example certification_server -- \
+  "$HOME/.cargo/bin/cargo" run --locked --quiet --example certification_server -- \
     "$address" "$state/ready" "$state/shutdown" "$profile" "$restart"
 else
-  "$HOME/.cargo/bin/cargo" run --quiet --example certification_server -- \
+  "$HOME/.cargo/bin/cargo" run --locked --quiet --example certification_server -- \
     "$address" "$state/ready" "$state/shutdown" "$profile"
 fi
 status=$?

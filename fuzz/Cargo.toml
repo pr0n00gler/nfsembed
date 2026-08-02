@@ -62,5 +62,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "nfs4_compound"
+path = "fuzz_targets/nfs4_compound.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nfs4_callback"
+path = "fuzz_targets/nfs4_callback.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_gss"
+path = "fuzz_targets/rpc_gss.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

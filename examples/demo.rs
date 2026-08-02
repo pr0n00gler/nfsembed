@@ -7,7 +7,10 @@ use nfsembed::vfs::{
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
-use nfsembed::{AuthPolicy, NfsServer, PortmapperSockets};
+use nfsembed::{
+    AuthPolicy, ExportConfig, ExportId, FileHandlePolicy, FileSystemId, NfsServer, PortmapperSockets, ProtocolSet,
+    SecurityPolicy, ServerSockets,
+};
 use tokio::net::{TcpListener, UdpSocket};
 
 const ROOT_ID: u64 = 1;
@@ -33,7 +36,7 @@ struct Entry {
 fn now() -> NfsTime {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     NfsTime {
-        seconds: duration.as_secs(),
+        seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         nanoseconds: duration.subsec_nanos(),
     }
 }
@@ -53,6 +56,7 @@ fn make_file(name: &[u8], id: u64, parent: u64, contents: &[u8]) -> Entry {
             device: None,
             fs_id: 0,
             file_id: id,
+            change_id: id.into(),
             access_time: time,
             modify_time: time,
             change_time: time,
@@ -79,6 +83,7 @@ fn make_directory(name: &[u8], id: u64, parent: u64, children: Vec<u64>) -> Entr
             device: None,
             fs_id: 0,
             file_id: id,
+            change_id: id.into(),
             access_time: time,
             modify_time: time,
             change_time: time,
@@ -135,6 +140,7 @@ impl DemoFs {
     fn wcc(attributes: &FileAttributes) -> WccAttributes {
         WccAttributes {
             size: attributes.size,
+            change_id: attributes.change_id,
             modify_time: attributes.modify_time,
             change_time: attributes.change_time,
         }
@@ -249,6 +255,7 @@ impl VirtualFileSystem for DemoFs {
         Self::apply_attributes(entry, attributes)?;
         Ok(MutationResult {
             value: (),
+            change_info: None,
             before,
             after: Some(entry.attributes.clone()),
         })
@@ -304,6 +311,7 @@ impl VirtualFileSystem for DemoFs {
                 count: data.len() as u32,
                 committed: requested,
             },
+            change_info: None,
             before,
             after: Some(entry.attributes.clone()),
         })
@@ -335,6 +343,7 @@ impl VirtualFileSystem for DemoFs {
             return if mode == CreateMode::Unchecked || replayed_exclusive {
                 Ok(MutationResult {
                     value: Self::created(existing),
+                    change_info: None,
                     before: Some(Self::wcc(&directory.attributes)),
                     after: Some(directory.attributes.clone()),
                 })
@@ -359,6 +368,7 @@ impl VirtualFileSystem for DemoFs {
         directory.attributes.change_time = now();
         Ok(MutationResult {
             value: created,
+            change_info: None,
             before,
             after: Some(directory.attributes.clone()),
         })
@@ -452,6 +462,7 @@ fn default_path_conf() -> PathConf {
 }
 
 const HOST_PORT: u16 = 11111;
+const MOUNT_PORT: u16 = 11112;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -461,24 +472,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let listener = TcpListener::bind(("127.0.0.1", HOST_PORT)).await?;
-    let server = NfsServer::builder(DemoFs::default())
+    let mount_listener = TcpListener::bind(("127.0.0.1", MOUNT_PORT)).await?;
+    let server = NfsServer::builder(ProtocolSet::V3)
+        .add_export_owned(
+            ExportConfig::new(
+                ExportId(1),
+                "/",
+                FileSystemId::new(0x4e46_5345, 1),
+                SecurityPolicy::auth_sys(),
+                FileHandlePolicy::Volatile,
+            ),
+            DemoFs::default(),
+        )
         .auth_policy(AuthPolicy::AuthSysOrAnonymous)
         .build()?;
     if let Ok(address) = std::env::var("NFSEMBED_PORTMAPPER") {
         let portmapper_tcp = TcpListener::bind(address).await?;
         let portmapper_udp = UdpSocket::bind(portmapper_tcp.local_addr()?).await?;
         server
-            .serve_with_portmapper(
-                listener,
-                PortmapperSockets::new(portmapper_tcp, portmapper_udp),
+            .serve(
+                ServerSockets::new(listener)
+                    .with_mount_listener(mount_listener)
+                    .with_portmapper(PortmapperSockets::new(portmapper_tcp, portmapper_udp)),
                 std::future::pending(),
             )
             .await?;
     } else {
-        server.serve(listener, std::future::pending()).await?;
+        server
+            .serve(ServerSockets::new(listener).with_mount_listener(mount_listener), std::future::pending())
+            .await?;
     }
     Ok(())
 }
 
 // Test with:
-// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
+// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11112,soft 127.0.0.1:/ mnt/

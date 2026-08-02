@@ -19,13 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-01
           components: rustfmt
       - name: Format
         run: |
-          cargo +nightly fmt --manifest-path ./Cargo.toml --all -- --check
+          cargo +nightly-2026-07-01 fmt --manifest-path ./Cargo.toml --all -- --check
 
   build_and_test-linux:
     runs-on: ubuntu-latest
@@ -33,40 +33,72 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - name: Install Rust 1.96 as the default gate toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          toolchain: nightly-2026-07-01
+          components: llvm-tools-preview,rust-src,rustfmt
+      - name: Install Rust 1.96.1 as the default gate toolchain
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: clippy,rustfmt
       - name: Install fuzz runner
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Full repository gate
+        env:
+          NIGHTLY_TOOLCHAIN: nightly-2026-07-01
         run: ./tests/run_ci.sh
       - name: Check Cargo.lock has no uncommitted changes
         run: |
           # the build and test steps would update Cargo.lock if it is out of date
           test -z "$(git status --porcelain Cargo.lock)" || (echo "Cargo.lock has uncommitted changes!" && exit 1)
 
+  rpcsec_gss-real-kdc:
+    name: Linux portable RPCSEC_GSS with real KDC
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Establish and protect RPCSEC_GSS v1/v2 contexts
+        run: make test-gss
+
   build_and_test-windows:
     name: Windows x64 MSVC tests and ARM64 compile
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.96 MSVC toolchains
-        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Rust 1.96.1 MSVC toolchains
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: clippy,rustfmt
           targets: aarch64-pc-windows-msvc
       - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (all features)
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test (default features)
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
       - name: Test (all features)
-        run: cargo test --all-features --all-targets
+        run: cargo test --locked --all-features --all-targets
       - name: Configure the MSVC ARM64 cross compiler
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
       - name: Compile all targets for Windows ARM64
-        run: cargo check --all-features --all-targets --target aarch64-pc-windows-msvc
+        run: cargo check --locked --all-features --all-targets --target aarch64-pc-windows-msvc
+
+  build_and_test-macos:
+    name: macOS ARM64 tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy,rustfmt
+      - name: Clippy (default features)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test (default features)
+        run: cargo test --locked --all-targets
+      - name: Test (all features)
+        run: cargo test --locked --all-features --all-targets

@@ -8,7 +8,26 @@ param(
 $ErrorActionPreference = "Stop"
 $repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $client = Join-Path $PSScriptRoot "client_windows.ps1"
-$probe = Join-Path $PSScriptRoot "procedure_probe.py"
+
+function Invoke-PythonEntrypoint([string]$RelativeScript, [string[]]$ScriptArguments) {
+    $hostScript = Join-Path $repository $RelativeScript
+    if ($env:CI -eq "true" -or $env:CI -eq "1" -or $env:NFSEMBED_CONTAINERIZED -eq "1") {
+        & python.exe $hostScript @ScriptArguments
+    } else {
+        $containerArguments = @($ScriptArguments)
+        if ($containerArguments.Count -gt 0 -and $containerArguments[0] -in @("127.0.0.1", "localhost")) {
+            $containerArguments[0] = "host.docker.internal"
+        }
+        & docker.exe compose `
+            --project-directory $repository `
+            -f (Join-Path $repository "compose.yaml") `
+            --profile scripts `
+            run --rm --no-deps script-runner $RelativeScript @containerArguments
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python entrypoint failed with exit code $LASTEXITCODE"
+    }
+}
 
 function Wait-Ready([string]$ReadyFile, [System.Diagnostics.Process]$Process) {
     $deadline = [DateTime]::UtcNow.AddMinutes(10)
@@ -16,7 +35,14 @@ function Wait-Ready([string]$ReadyFile, [System.Diagnostics.Process]$Process) {
         if (Test-Path -LiteralPath $ReadyFile) {
             $value = (Get-Content -LiteralPath $ReadyFile -Raw).Trim()
             if ($value) {
-                return [int]$value
+                $ports = @($value -split "\s+")
+                if ($ports.Count -ne 2) {
+                    throw "certification server readiness did not contain NFS and MOUNT ports: $value"
+                }
+                return [PSCustomObject]@{
+                    Nfs = [int]$ports[0]
+                    Mount = [int]$ports[1]
+                }
             }
         }
         if ($Process.HasExited) {
@@ -123,7 +149,9 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
     $null = $process.Handle
 
     try {
-        $serverPort = Wait-Ready $ready $process
+        $serverPorts = Wait-Ready $ready $process
+        $serverPort = $serverPorts.Nfs
+        $mountPort = $serverPorts.Mount
         Reset-NfsClient
         & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $client -ServerHost $ServerHost -Profile $ClientProfile -Drive $Drive
         if ($LASTEXITCODE -ne 0) {
@@ -131,10 +159,9 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
         }
 
         if ($Profile -eq "read-write") {
-            & python.exe $probe $ServerHost $serverPort
-            if ($LASTEXITCODE -ne 0) {
-                throw "NFS procedure probe failed"
-            }
+            Invoke-PythonEntrypoint `
+                -RelativeScript "tests/native/procedure_probe.py" `
+                -ScriptArguments @($ServerHost, [string]$serverPort, [string]$mountPort)
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $client -ServerHost $ServerHost -Profile restart-prepare -Drive $Drive
             if ($LASTEXITCODE -ne 0) {
                 throw "restart preparation failed"
@@ -148,10 +175,9 @@ function Run-Profile([string]$Profile, [string]$ClientProfile) {
                 throw "restart verification failed"
             }
         } elseif ($Profile -eq "read-only") {
-            & python.exe $probe $ServerHost $serverPort read-only
-            if ($LASTEXITCODE -ne 0) {
-                throw "read-only procedure probe failed"
-            }
+            Invoke-PythonEntrypoint `
+                -RelativeScript "tests/native/procedure_probe.py" `
+                -ScriptArguments @($ServerHost, [string]$serverPort, [string]$mountPort, "read-only")
         }
 
         Stop-CertificationServer $process $shutdown $stderr

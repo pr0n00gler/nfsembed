@@ -25,7 +25,7 @@ function Invoke-Native([string]$Command, [string[]]$Arguments) {
 }
 
 function Mount-CertificationExport {
-    $options = "anon,nolock,mtype=soft,fileaccess=777,lang=ansi,rsize=32,wsize=32,timeout=3,retry=2"
+    $options = "sec=sys,nolock,mtype=soft,fileaccess=777,lang=ansi,rsize=32,wsize=32,timeout=3,retry=2"
     if ($Profile -notin @("case-insensitive", "mirror")) {
         $options += ",casesensitive"
     }

@@ -45,19 +45,24 @@ run_profile() {
   restart_file=$state_dir/restart
   server_log=$state_dir/server.log
 
-  cargo run --quiet --example certification_server -- \
+  cargo run --locked --quiet --example certification_server -- \
     "0.0.0.0:$port" "$ready_file" "$shutdown_file" "$profile" "$restart_file" \
     >"$server_log" 2>&1 &
   server_pid=$!
   wait_ready
+  read -r server_port mount_port <"$ready_file"
 
-  limactl shell "$instance" -- "$guest_root/tests/native/client.sh" host.lima.internal "$port" "$client_mode"
+  limactl shell "$instance" -- \
+    "$guest_root/tests/native/client.sh" host.lima.internal "$server_port" "$client_mode" "$mount_port"
   if [ "$profile" = "read-write" ]; then
-    limactl shell "$instance" -- "$guest_root/tests/native/client.sh" host.lima.internal "$port" restart-prepare
+    limactl shell "$instance" -- \
+      "$guest_root/tests/native/client.sh" host.lima.internal "$server_port" restart-prepare "$mount_port"
     rm -f "$ready_file"
     : >"$restart_file"
     wait_ready
-    limactl shell "$instance" -- "$guest_root/tests/native/client.sh" host.lima.internal "$port" restart-verify
+    read -r server_port mount_port <"$ready_file"
+    limactl shell "$instance" -- \
+      "$guest_root/tests/native/client.sh" host.lima.internal "$server_port" restart-verify "$mount_port"
   fi
 
   : >"$shutdown_file"

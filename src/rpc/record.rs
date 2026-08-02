@@ -181,13 +181,18 @@ pub async fn write_record_limited<W: AsyncWrite + Unpin>(
     write_fragments(writer, record, limits.max_fragment_size).await
 }
 
-/// Writes a record held in up to three immutable segments without first
+/// Writes a record held in any number of immutable segments without first
 /// coalescing them. Fragment boundaries may cross segment boundaries.
-pub async fn write_record_segments_limited<W: AsyncWrite + Unpin>(
+pub async fn write_record_segments_limited<'a, W, I>(
     writer: &mut W,
-    segments: [&[u8]; 3],
+    segments: I,
     limits: RecordLimits,
-) -> Result<(), RecordError> {
+) -> Result<(), RecordError>
+where
+    W: AsyncWrite + Unpin,
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let segments: Vec<&[u8]> = segments.into_iter().collect();
     let length = segments.iter().try_fold(0usize, |length, segment| {
         length.checked_add(segment.len()).ok_or(RecordError::RecordTooLarge {
             limit: limits.max_record_size,
@@ -232,7 +237,7 @@ pub fn validate_record_length(length: usize, limits: RecordLimits) -> Result<(),
 
 async fn write_segmented_fragments<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    segments: [&[u8]; 3],
+    segments: Vec<&[u8]>,
     total_length: usize,
     max_fragment_size: usize,
 ) -> Result<(), RecordError> {
@@ -253,9 +258,8 @@ async fn write_segmented_fragments<W: AsyncWrite + Unpin>(
         }
         let last = fragment_length == remaining_total;
         let header = (fragment_length as u32 | if last { 0x8000_0000 } else { 0 }).to_be_bytes();
-        let mut slices = [IoSlice::new(&[]); 4];
-        slices[0] = IoSlice::new(&header);
-        let mut slice_count = 1usize;
+        let mut slices = Vec::with_capacity(segments.len().saturating_add(1));
+        slices.push(IoSlice::new(&header));
         let mut current_index = segment_index;
         let mut current_offset = segment_offset;
         let mut remaining_fragment = fragment_length;
@@ -268,12 +272,11 @@ async fn write_segmented_fragments<W: AsyncWrite + Unpin>(
                 .get(current_index)
                 .ok_or(RecordError::RecordTooLarge { limit: total_length })?;
             let take = remaining_fragment.min(segment.len() - current_offset);
-            slices[slice_count] = IoSlice::new(&segment[current_offset..current_offset + take]);
-            slice_count += 1;
+            slices.push(IoSlice::new(&segment[current_offset..current_offset + take]));
             remaining_fragment -= take;
             current_offset += take;
         }
-        write_all_slices(writer, &mut slices[..slice_count]).await?;
+        write_all_slices(writer, &mut slices).await?;
         advance_segments(&segments, &mut segment_index, &mut segment_offset, fragment_length);
         remaining_total -= fragment_length;
     }
@@ -625,7 +628,7 @@ mod tests {
         let mut output = Vec::new();
         write_record_segments_limited(
             &mut output,
-            [b"abc", b"defgh", b"ij"],
+            [&b"abc"[..], &b"defgh"[..], &b"ij"[..]],
             RecordLimits {
                 max_record_size: 10,
                 max_fragment_size: 4,

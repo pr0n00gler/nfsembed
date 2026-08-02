@@ -39,8 +39,14 @@ impl ServerLimits {
             max_requests_per_connection: 32,
             max_inflight_requests: 2048,
             max_rpc_record_size: 2 * 1024 * 1024,
-            max_rpc_fragment_size: 1024 * 1024,
-            max_fragments_per_record: 16,
+            // A client is free to place any valid record in one RPC record
+            // fragment. Keep the production fragment limit large enough for
+            // the advertised one-mebibyte WRITE plus its RPC/NFS envelope.
+            max_rpc_fragment_size: 2 * 1024 * 1024,
+            // Some established RPC clients (including the pinned pynfs
+            // client) emit 2 KiB record fragments. The aggregate record-size
+            // bound still caps memory while this count permits max-sized I/O.
+            max_fragments_per_record: 1024,
             max_buffered_request_bytes: 64 * 1024 * 1024,
             max_buffered_reply_bytes: 64 * 1024 * 1024,
             max_read_size: 1024 * 1024,
@@ -126,6 +132,70 @@ impl Default for ServerLimits {
     }
 }
 
+/// Bounds for state and work unique to NFSv4.0.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nfs4Limits {
+    pub max_compound_operations: usize,
+    pub max_clients: usize,
+    pub max_open_owners_per_client: usize,
+    /// Maximum number of still-effective OPEN requests represented by one
+    /// open state, including repeated requests with identical share modes.
+    pub max_open_contributions_per_state: usize,
+    pub max_lock_owners_per_client: usize,
+    /// Maximum number of normalized byte-range fragments held by one lock
+    /// state (that is, one lock owner on one file).
+    pub max_lock_ranges_per_state: usize,
+    pub max_state_objects: usize,
+    pub max_client_owner_size: usize,
+    pub max_state_payload_size: usize,
+}
+
+impl Nfs4Limits {
+    pub fn production_defaults() -> Self {
+        Self {
+            max_compound_operations: 64,
+            max_clients: 16_384,
+            max_open_owners_per_client: 4_096,
+            max_open_contributions_per_state: 4_096,
+            max_lock_owners_per_client: 4_096,
+            max_lock_ranges_per_state: 4_096,
+            max_state_objects: 262_144,
+            max_client_owner_size: 1_024,
+            max_state_payload_size: 16 * 1024 * 1024,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.max_compound_operations == 0
+            || self.max_clients == 0
+            || self.max_open_owners_per_client == 0
+            || self.max_open_contributions_per_state == 0
+            || self.max_lock_owners_per_client == 0
+            || self.max_lock_ranges_per_state == 0
+            || self.max_state_objects == 0
+            || self.max_client_owner_size == 0
+            || self.max_state_payload_size == 0
+        {
+            return Err("NFSv4 limits must be greater than zero");
+        }
+        if self.max_compound_operations > u32::MAX as usize
+            || self.max_open_contributions_per_state > u32::MAX as usize
+            || self.max_lock_ranges_per_state > u32::MAX as usize
+            || self.max_client_owner_size > u32::MAX as usize
+            || self.max_state_payload_size > u32::MAX as usize
+        {
+            return Err("NFSv4 limits exceed the wire range");
+        }
+        Ok(())
+    }
+}
+
+impl Default for Nfs4Limits {
+    fn default() -> Self {
+        Self::production_defaults()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,7 +207,7 @@ mod tests {
     #[test]
     fn mutation_reply_bound_covers_the_largest_complete_union_arm() {
         let time = NfsTime {
-            seconds: u64::from(u32::MAX),
+            seconds: i64::from(u32::MAX),
             nanoseconds: 999_999_999,
         };
         let attributes = FileAttributes {
@@ -151,6 +221,7 @@ mod tests {
             device: None,
             fs_id: u64::MAX,
             file_id: u64::MAX,
+            change_id: u64::MAX.into(),
             access_time: time,
             modify_time: time,
             change_time: time,
@@ -162,6 +233,7 @@ mod tests {
             directory_wcc: crate::nfs3::types::WccData {
                 before: Some(WccAttributes {
                     size: u64::MAX,
+                    change_id: u64::MAX.into(),
                     modify_time: time,
                     change_time: time,
                 }),
@@ -186,5 +258,19 @@ mod tests {
 
         limits.max_write_size += 1;
         assert_eq!(limits.validate(), Err("transfer limits exceed the effective RPC transport capacity"));
+    }
+
+    #[test]
+    fn production_maxwrite_fits_in_one_client_selected_fragment() {
+        let limits = ServerLimits::production_defaults();
+        assert!(
+            limits.max_write_size as usize + MAXIMUM_WRITE_RECORD_OVERHEAD <= limits.max_rpc_fragment_size,
+            "the advertised maxwrite must fit when a client sends one record fragment"
+        );
+        assert!(
+            (limits.max_write_size as usize + MAXIMUM_WRITE_RECORD_OVERHEAD).div_ceil(2048)
+                <= limits.max_fragments_per_record,
+            "the advertised maxwrite must fit a conventional 2 KiB RPC fragment stream"
+        );
     }
 }

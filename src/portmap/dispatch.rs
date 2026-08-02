@@ -1,12 +1,21 @@
 use super::{mapping, IPPROTO_TCP};
 
-pub fn get_port(request: &mapping, nfs_port: u16, mount_port: u16) -> u32 {
+pub fn get_port(
+    request: &mapping,
+    nfs_port: u16,
+    mount_port: Option<u16>,
+    includes_v3: bool,
+    includes_v4: bool,
+) -> u32 {
     if request.prot != IPPROTO_TCP {
         return 0;
     }
     match (request.prog, request.vers) {
-        (crate::nfs3::types::PROGRAM, crate::nfs3::types::VERSION) => u32::from(nfs_port),
-        (crate::mount3::types::PROGRAM, crate::mount3::types::VERSION) => u32::from(mount_port),
+        (crate::nfs3::types::PROGRAM, crate::nfs3::types::VERSION) if includes_v3 => u32::from(nfs_port),
+        (crate::nfs4::PROGRAM, crate::nfs4::VERSION) if includes_v4 => u32::from(nfs_port),
+        (crate::mount3::types::PROGRAM, crate::mount3::types::VERSION) if includes_v3 => {
+            mount_port.map_or(0, u32::from)
+        },
         _ => 0,
     }
 }
@@ -34,10 +43,46 @@ mod tests {
                         port: u32::MAX,
                     },
                     20_049,
-                    20_048,
+                    Some(20_048),
+                    true,
+                    false,
                 ),
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn v4_only_advertises_nfs_without_mount() {
+        assert_eq!(
+            get_port(
+                &mapping {
+                    prog: crate::nfs4::PROGRAM,
+                    vers: crate::nfs4::VERSION,
+                    prot: IPPROTO_TCP,
+                    port: 0,
+                },
+                20_049,
+                None,
+                false,
+                true,
+            ),
+            20_049,
+        );
+        assert_eq!(
+            get_port(
+                &mapping {
+                    prog: crate::mount3::types::PROGRAM,
+                    vers: crate::mount3::types::VERSION,
+                    prot: IPPROTO_TCP,
+                    port: 0,
+                },
+                20_049,
+                None,
+                false,
+                true,
+            ),
+            0,
+        );
     }
 }
